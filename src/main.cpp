@@ -4,6 +4,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <ASM330LHHSensor.h>
 #include <driver/twai.h>
 #include <math.h>
 #include <mcp2515.h>
@@ -59,6 +60,8 @@ constexpr uint8_t kAsm330RegOutTempL = 0x20;
 constexpr uint8_t kAsm330WhoAmIValue = 0x6B;
 constexpr uint8_t kAsm330I2cAddressLow = 0x6A;
 constexpr uint8_t kAsm330I2cAddressHigh = 0x6B;
+constexpr uint8_t kAsm330DriverAddressLow = ASM330LHH_I2C_ADD_L;
+constexpr uint8_t kAsm330DriverAddressHigh = ASM330LHH_I2C_ADD_H;
 
 constexpr uint8_t kAsm330Ctrl1Xl416Hz16g = 0x64;
 constexpr uint8_t kAsm330Ctrl2G416Hz2000dps = 0x6C;
@@ -69,6 +72,9 @@ constexpr uint8_t kAsm330Ctrl4CI2cEnable = 0x00;
 constexpr uint8_t kAsm330Ctrl9XlDeviceConf = 0x02;
 constexpr uint8_t kAsm330Int1DataReady = 0x03;
 constexpr uint32_t kAsm330ResetTimeoutMs = 100;
+constexpr float kAsm330TargetOdrHz = 417.0f;
+constexpr int32_t kAsm330TargetAccelRangeG = 16;
+constexpr int32_t kAsm330TargetGyroRangeDps = 2000;
 constexpr uint8_t kAsm330StatusAccelReady = 0x01;
 constexpr uint8_t kAsm330StatusGyroReady = 0x02;
 constexpr uint8_t kAsm330StatusAccelGyroReady = kAsm330StatusAccelReady | kAsm330StatusGyroReady;
@@ -77,6 +83,9 @@ constexpr float kAccelScaleGPerLsb = 0.000488f;
 constexpr float kGyroScaleDpsPerLsb = 0.07f;
 
 TwoWire imuI2c(0);
+ASM330LHHSensor asm330SensorHigh(&imuI2c, kAsm330DriverAddressHigh);
+ASM330LHHSensor asm330SensorLow(&imuI2c, kAsm330DriverAddressLow);
+ASM330LHHSensor *g_asm330Sensor = &asm330SensorHigh;
 SPIClass canSpi(HSPI);
 MCP2515 mcp2515(kMcp2515CsPin, 8000000, &canSpi);
 
@@ -245,42 +254,30 @@ void putUint32Le(uint8_t *buffer, const int index, const uint32_t value) {
 }
 
 bool asm330WriteBytes(const uint8_t reg, const uint8_t *data, const size_t length) {
-  imuI2c.beginTransmission(g_asm330I2cAddress);
-  imuI2c.write(reg);
-  for (size_t index = 0; index < length; ++index) {
-    imuI2c.write(data[index]);
-  }
-
-  return imuI2c.endTransmission(true) == 0;
+  return g_asm330Sensor->IO_Write(const_cast<uint8_t *>(data), reg, static_cast<uint16_t>(length)) == 0;
 }
 
 uint8_t asm330ReadRegister(const uint8_t reg) {
   uint8_t value = 0;
-  asm330ReadRegisters(reg, &value, 1U);
+  if (g_asm330Sensor->Read_Reg(reg, &value) != ASM330LHH_OK) {
+    return 0;
+  }
   return value;
 }
 
 void asm330ReadRegisters(const uint8_t startReg, uint8_t *buffer, const size_t length) {
   memset(buffer, 0, length);
-
-  imuI2c.beginTransmission(g_asm330I2cAddress);
-  imuI2c.write(startReg);
-  if (imuI2c.endTransmission(false) != 0) {
-    return;
-  }
-
-  const size_t received = imuI2c.requestFrom(static_cast<int>(g_asm330I2cAddress), static_cast<int>(length), static_cast<int>(true));
-  for (size_t index = 0; index < length && index < received && imuI2c.available(); ++index) {
-    buffer[index] = static_cast<uint8_t>(imuI2c.read());
-  }
+  g_asm330Sensor->IO_Read(buffer, startReg, static_cast<uint16_t>(length));
 }
 
 void asm330WriteRegister(const uint8_t reg, const uint8_t value) {
-  asm330WriteBytes(reg, &value, 1U);
+  uint8_t mutableValue = value;
+  g_asm330Sensor->Write_Reg(reg, mutableValue);
 }
 
 bool asm330WriteRegisterChecked(const uint8_t reg, const uint8_t value) {
-  return asm330WriteBytes(reg, &value, 1U);
+  uint8_t mutableValue = value;
+  return g_asm330Sensor->Write_Reg(reg, mutableValue) == ASM330LHH_OK;
 }
 
 bool asm330UpdateRegisterBits(const uint8_t reg, const uint8_t mask, const uint8_t value) {
@@ -396,6 +393,7 @@ bool initAsm330() {
   pinMode(kAsm330Sa0Pin, OUTPUT);
   digitalWrite(kAsm330Sa0Pin, kAsm330Sa0High ? HIGH : LOW);
   g_asm330I2cAddress = kAsm330Sa0High ? kAsm330I2cAddressHigh : kAsm330I2cAddressLow;
+  g_asm330Sensor = kAsm330Sa0High ? &asm330SensorHigh : &asm330SensorLow;
 
   imuI2c.begin(kAsm330SdaPin, kAsm330SclPin, kAsm330I2cHz);
   imuI2c.setTimeOut(20);
@@ -439,14 +437,17 @@ bool initAsm330() {
     return false;
   }
 
-  if (!asm330UpdateRegisterBits(kAsm330RegCtrl9Xl, kAsm330Ctrl9XlDeviceConf, kAsm330Ctrl9XlDeviceConf) ||
-      !asm330UpdateRegisterBits(kAsm330RegCtrl3C, kAsm330Ctrl3CBduIfInc, kAsm330Ctrl3CBduIfInc) ||
+  if (g_asm330Sensor->begin() != ASM330LHH_OK ||
+      g_asm330Sensor->Set_X_FS(kAsm330TargetAccelRangeG) != ASM330LHH_OK ||
+      g_asm330Sensor->Set_G_FS(kAsm330TargetGyroRangeDps) != ASM330LHH_OK ||
+      g_asm330Sensor->Set_X_ODR(kAsm330TargetOdrHz) != ASM330LHH_OK ||
+      g_asm330Sensor->Set_G_ODR(kAsm330TargetOdrHz) != ASM330LHH_OK ||
+      g_asm330Sensor->Enable_X() != ASM330LHH_OK ||
+      g_asm330Sensor->Enable_G() != ASM330LHH_OK ||
       !asm330UpdateRegisterBits(kAsm330RegCtrl4C, kAsm330Ctrl4CI2cDisable, kAsm330Ctrl4CI2cEnable) ||
-      !asm330WriteRegisterChecked(kAsm330RegCtrl1Xl, kAsm330Ctrl1Xl416Hz16g) ||
-      !asm330WriteRegisterChecked(kAsm330RegCtrl2G, kAsm330Ctrl2G416Hz2000dps) ||
       !asm330WriteRegisterChecked(kAsm330RegInt1Ctrl, kAsm330Int1DataReady)) {
     g_asm330InitFailureCount++;
-    Serial.println("BOOT,ASM330,ERR,I2C_WRITE_FAIL");
+    Serial.println("BOOT,ASM330,ERR,DRIVER_INIT_FAIL");
     printAsm330KeyRegisters("BOOT,ASM330,REGS_WRITE_FAIL");
     printAsm330InitState("ASM330,INIT,STATE");
     return false;
@@ -491,7 +492,7 @@ bool initAsm330() {
   g_asm330InitSuccessCount++;
   g_asm330InitRetryEnabled = false;
   printAsm330InitState("ASM330,INIT,STATE");
-  Serial.println("BOOT,ASM330,OK,ODR=416HZ,ACC=16G,GYRO=2000DPS");
+  Serial.println("BOOT,ASM330,OK,ODR=417HZ,ACC=16G,GYRO=2000DPS,DRV=ST");
   return true;
 }
 
@@ -671,6 +672,11 @@ bool readAsm330Sample(ImuSample &sample) {
   g_imuDataReady = false;
   g_lastImuPollUs = nowUs;
 
+  if (g_asm330Sensor->Get_G_AxesRaw(sample.gyroRaw) != ASM330LHH_OK ||
+      g_asm330Sensor->Get_X_AxesRaw(sample.accelRaw) != ASM330LHH_OK) {
+    return false;
+  }
+
   uint8_t rawBytes[14] = {};
   asm330ReadRegisters(kAsm330RegOutTempL, rawBytes, sizeof(rawBytes));
   memcpy(g_asm330LastRawBytes, rawBytes, sizeof(rawBytes));
@@ -678,12 +684,6 @@ bool readAsm330Sample(ImuSample &sample) {
   sample.tempRaw = static_cast<int16_t>((static_cast<uint16_t>(rawBytes[1]) << 8) | rawBytes[0]);
 
   for (int axis = 0; axis < 3; ++axis) {
-    const int gyroIndex = 2 + (axis * 2);
-    const int accelIndex = 8 + (axis * 2);
-
-    sample.gyroRaw[axis] = static_cast<int16_t>((static_cast<uint16_t>(rawBytes[gyroIndex + 1]) << 8) | rawBytes[gyroIndex]);
-    sample.accelRaw[axis] = static_cast<int16_t>((static_cast<uint16_t>(rawBytes[accelIndex + 1]) << 8) | rawBytes[accelIndex]);
-
     sample.gyroDps[axis] = static_cast<float>(sample.gyroRaw[axis]) * kGyroScaleDpsPerLsb;
     sample.accelG[axis] = static_cast<float>(sample.accelRaw[axis]) * kAccelScaleGPerLsb;
   }
