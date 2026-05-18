@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <driver/twai.h>
 #include <math.h>
 #include <mcp2515.h>
@@ -26,11 +27,13 @@ constexpr int kRecordButtonPin = 38;
 constexpr int kTwaiTxPin = 4;
 constexpr int kTwaiRxPin = 5;
 
-constexpr int kAsm330MosiPin = 6;
-constexpr int kAsm330MisoPin = 7;
-constexpr int kAsm330SckPin = 8;
+constexpr int kAsm330SdaPin = 6;
+constexpr int kAsm330Sa0Pin = 7;
+constexpr int kAsm330SclPin = 8;
 constexpr int kAsm330DrdyPin = 45;
 constexpr int kAsm330CsPin = 35;  // bodge wire: was GND, now IO35
+constexpr bool kAsm330Sa0High = true;
+constexpr uint32_t kAsm330I2cHz = 400000;
 
 constexpr int kSdCsPin = 9;
 constexpr int kMcp2515CsPin = 10;
@@ -54,13 +57,18 @@ constexpr uint8_t kAsm330RegCtrl9Xl = 0x18;
 constexpr uint8_t kAsm330RegStatus = 0x1E;
 constexpr uint8_t kAsm330RegOutTempL = 0x20;
 constexpr uint8_t kAsm330WhoAmIValue = 0x6B;
+constexpr uint8_t kAsm330I2cAddressLow = 0x6A;
+constexpr uint8_t kAsm330I2cAddressHigh = 0x6B;
 
 constexpr uint8_t kAsm330Ctrl1Xl416Hz16g = 0x64;
 constexpr uint8_t kAsm330Ctrl2G416Hz2000dps = 0x6C;
+constexpr uint8_t kAsm330Ctrl3CSwReset = 0x01;
 constexpr uint8_t kAsm330Ctrl3CBduIfInc = 0x44;
 constexpr uint8_t kAsm330Ctrl4CI2cDisable = 0x04;
+constexpr uint8_t kAsm330Ctrl4CI2cEnable = 0x00;
 constexpr uint8_t kAsm330Ctrl9XlDeviceConf = 0x02;
 constexpr uint8_t kAsm330Int1DataReady = 0x03;
+constexpr uint32_t kAsm330ResetTimeoutMs = 100;
 constexpr uint8_t kAsm330StatusAccelReady = 0x01;
 constexpr uint8_t kAsm330StatusGyroReady = 0x02;
 constexpr uint8_t kAsm330StatusAccelGyroReady = kAsm330StatusAccelReady | kAsm330StatusGyroReady;
@@ -68,7 +76,7 @@ constexpr uint8_t kAsm330StatusAccelGyroReady = kAsm330StatusAccelReady | kAsm33
 constexpr float kAccelScaleGPerLsb = 0.000488f;
 constexpr float kGyroScaleDpsPerLsb = 0.07f;
 
-SPIClass imuSpi(FSPI);
+TwoWire imuI2c(0);
 SPIClass canSpi(HSPI);
 MCP2515 mcp2515(kMcp2515CsPin, 8000000, &canSpi);
 
@@ -116,6 +124,7 @@ uint8_t g_asm330LastRawBytes[14] = {};
 uint8_t g_asm330LastCtrl4C = 0;
 uint8_t g_asm330LastCtrl9Xl = 0;
 uint8_t g_asm330LastInt1Ctrl = 0;
+uint8_t g_asm330I2cAddress = kAsm330I2cAddressHigh;
 char g_serialCommandBuffer[64] = {};
 size_t g_serialCommandLength = 0;
 bool g_asm330InitRetryEnabled = false;
@@ -133,6 +142,8 @@ struct ImuSample {
   bool hardStop;
   uint32_t timestampMs;
 };
+
+void asm330ReadRegisters(uint8_t startReg, uint8_t *buffer, size_t length);
 
 void IRAM_ATTR onAsm330DataReady() {
   g_imuDataReady = true;
@@ -233,46 +244,65 @@ void putUint32Le(uint8_t *buffer, const int index, const uint32_t value) {
   buffer[index + 3] = static_cast<uint8_t>((value >> 24) & 0xFF);
 }
 
-void asm330Select() {
-  if (kAsm330CsPin >= 0) {
-    digitalWrite(kAsm330CsPin, LOW);
+bool asm330WriteBytes(const uint8_t reg, const uint8_t *data, const size_t length) {
+  imuI2c.beginTransmission(g_asm330I2cAddress);
+  imuI2c.write(reg);
+  for (size_t index = 0; index < length; ++index) {
+    imuI2c.write(data[index]);
   }
-}
 
-void asm330Deselect() {
-  if (kAsm330CsPin >= 0) {
-    digitalWrite(kAsm330CsPin, HIGH);
-  }
+  return imuI2c.endTransmission(true) == 0;
 }
 
 uint8_t asm330ReadRegister(const uint8_t reg) {
-  imuSpi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  asm330Select();
-  imuSpi.transfer(static_cast<uint8_t>(reg | 0x80));
-  const uint8_t value = imuSpi.transfer(0x00);
-  asm330Deselect();
-  imuSpi.endTransaction();
+  uint8_t value = 0;
+  asm330ReadRegisters(reg, &value, 1U);
   return value;
 }
 
 void asm330ReadRegisters(const uint8_t startReg, uint8_t *buffer, const size_t length) {
-  imuSpi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  asm330Select();
-  imuSpi.transfer(static_cast<uint8_t>(startReg | 0x80));
-  for (size_t index = 0; index < length; ++index) {
-    buffer[index] = imuSpi.transfer(0x00);
+  memset(buffer, 0, length);
+
+  imuI2c.beginTransmission(g_asm330I2cAddress);
+  imuI2c.write(startReg);
+  if (imuI2c.endTransmission(false) != 0) {
+    return;
   }
-  asm330Deselect();
-  imuSpi.endTransaction();
+
+  const size_t received = imuI2c.requestFrom(static_cast<int>(g_asm330I2cAddress), static_cast<int>(length), static_cast<int>(true));
+  for (size_t index = 0; index < length && index < received && imuI2c.available(); ++index) {
+    buffer[index] = static_cast<uint8_t>(imuI2c.read());
+  }
 }
 
 void asm330WriteRegister(const uint8_t reg, const uint8_t value) {
-  imuSpi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  asm330Select();
-  imuSpi.transfer(static_cast<uint8_t>(reg & 0x7F));
-  imuSpi.transfer(value);
-  asm330Deselect();
-  imuSpi.endTransaction();
+  asm330WriteBytes(reg, &value, 1U);
+}
+
+bool asm330WriteRegisterChecked(const uint8_t reg, const uint8_t value) {
+  return asm330WriteBytes(reg, &value, 1U);
+}
+
+bool asm330UpdateRegisterBits(const uint8_t reg, const uint8_t mask, const uint8_t value) {
+  const uint8_t current = asm330ReadRegister(reg);
+  const uint8_t updated = static_cast<uint8_t>((current & ~mask) | (value & mask));
+  return asm330WriteRegisterChecked(reg, updated);
+}
+
+bool asm330ResetDevice() {
+  if (!asm330UpdateRegisterBits(kAsm330RegCtrl3C, kAsm330Ctrl3CSwReset, kAsm330Ctrl3CSwReset)) {
+    return false;
+  }
+
+  const uint32_t startMs = millis();
+  while ((millis() - startMs) < kAsm330ResetTimeoutMs) {
+    if ((asm330ReadRegister(kAsm330RegCtrl3C) & kAsm330Ctrl3CSwReset) == 0U) {
+      return true;
+    }
+    delay(1);
+  }
+
+  return false;
 }
 
 void printAsm330KeyRegisters(const char *prefix) {
@@ -295,8 +325,9 @@ void printAsm330KeyRegisters(const char *prefix) {
   g_asm330LastInt1Ctrl = int1Ctrl;
 
   Serial.printf(
-      "%s,WHOAMI=0x%02X,CTRL1_XL=0x%02X,CTRL2_G=0x%02X,CTRL3_C=0x%02X,CTRL4_C=0x%02X,CTRL9_XL=0x%02X,INT1_CTRL=0x%02X,STATUS=0x%02X,DRDY_PIN=%d\n",
+      "%s,ADDR=0x%02X,WHOAMI=0x%02X,CTRL1_XL=0x%02X,CTRL2_G=0x%02X,CTRL3_C=0x%02X,CTRL4_C=0x%02X,CTRL9_XL=0x%02X,INT1_CTRL=0x%02X,STATUS=0x%02X,DRDY_PIN=%d\n",
       prefix,
+      g_asm330I2cAddress,
       whoAmI,
       ctrl1Xl,
       ctrl2G,
@@ -310,7 +341,7 @@ void printAsm330KeyRegisters(const char *prefix) {
 
 void printAsm330InitState(const char *prefix) {
   Serial.printf(
-      "%s,READY=%u,RETRY=%u,LAST_OK=%u,INIT_CYCLES=%lu,INIT_OK=%lu,INIT_FAIL=%lu,WHOAMI=0x%02X,CTRL4_C=0x%02X,CTRL9_XL=0x%02X\n",
+  "%s,READY=%u,RETRY=%u,LAST_OK=%u,INIT_CYCLES=%lu,INIT_OK=%lu,INIT_FAIL=%lu,ADDR=0x%02X,WHOAMI=0x%02X,CTRL3_C=0x%02X,CTRL4_C=0x%02X,CTRL9_XL=0x%02X\n",
       prefix,
       g_imuReady ? 1U : 0U,
       g_asm330InitRetryEnabled ? 1U : 0U,
@@ -318,6 +349,7 @@ void printAsm330InitState(const char *prefix) {
       static_cast<unsigned long>(g_asm330InitCycleCount),
       static_cast<unsigned long>(g_asm330InitSuccessCount),
       static_cast<unsigned long>(g_asm330InitFailureCount),
+      g_asm330I2cAddress,
       g_asm330LastWhoAmI,
       g_asm330LastCtrl3C,
       g_asm330LastCtrl4C,
@@ -351,6 +383,9 @@ bool initAsm330() {
   g_asm330InitCycleCount++;
   g_lastAsm330InitAttemptMs = millis();
   g_imuDataReady = false;
+  g_asm330LastInitSucceeded = false;
+
+  detachInterrupt(digitalPinToInterrupt(kAsm330DrdyPin));
 
   pinMode(kAsm330DrdyPin, INPUT);
   if (kAsm330CsPin >= 0) {
@@ -358,16 +393,24 @@ bool initAsm330() {
     digitalWrite(kAsm330CsPin, HIGH);
   }
 
-  imuSpi.begin(kAsm330SckPin, kAsm330MisoPin, kAsm330MosiPin, kAsm330CsPin >= 0 ? kAsm330CsPin : -1);
+  pinMode(kAsm330Sa0Pin, OUTPUT);
+  digitalWrite(kAsm330Sa0Pin, kAsm330Sa0High ? HIGH : LOW);
+  g_asm330I2cAddress = kAsm330Sa0High ? kAsm330I2cAddressHigh : kAsm330I2cAddressLow;
+
+  imuI2c.begin(kAsm330SdaPin, kAsm330SclPin, kAsm330I2cHz);
+  imuI2c.setTimeOut(20);
   delay(10);
 
   Serial.printf(
-      "BOOT,ASM330,CFG,MOSI=%d,MISO=%d,SCK=%d,CS=%d,DRDY=%d,SPI_MODE=3,SPI_HZ=1000000\n",
-      kAsm330MosiPin,
-      kAsm330MisoPin,
-      kAsm330SckPin,
+      "BOOT,ASM330,CFG,SDA=%d,SCL=%d,SA0_PIN=%d,SA0_LEVEL=%d,ADDR=0x%02X,CS=%d,DRDY=%d,I2C_HZ=%lu\n",
+      kAsm330SdaPin,
+      kAsm330SclPin,
+      kAsm330Sa0Pin,
+      kAsm330Sa0High ? 1 : 0,
+      g_asm330I2cAddress,
       kAsm330CsPin,
-      kAsm330DrdyPin);
+      kAsm330DrdyPin,
+      static_cast<unsigned long>(kAsm330I2cHz));
 
   uint8_t whoAmI = 0;
   for (uint32_t attempt = 1; attempt <= kAsm330StartupRetries; ++attempt) {
@@ -381,17 +424,34 @@ bool initAsm330() {
   }
 
   if (whoAmI != kAsm330WhoAmIValue) {
+    g_asm330InitFailureCount++;
     Serial.printf("BOOT,ASM330,ERR,WHOAMI,0x%02X\n", whoAmI);
     printAsm330KeyRegisters("BOOT,ASM330,REGS_FAIL");
+    printAsm330InitState("ASM330,INIT,STATE");
     return false;
   }
 
-  asm330WriteRegister(kAsm330RegCtrl3C, kAsm330Ctrl3CBduIfInc);
-  asm330WriteRegister(kAsm330RegCtrl4C, kAsm330Ctrl4CI2cDisable);
-  asm330WriteRegister(kAsm330RegCtrl9Xl, kAsm330Ctrl9XlDeviceConf);
-  asm330WriteRegister(kAsm330RegCtrl1Xl, kAsm330Ctrl1Xl416Hz16g);
-  asm330WriteRegister(kAsm330RegCtrl2G, kAsm330Ctrl2G416Hz2000dps);
-  asm330WriteRegister(kAsm330RegInt1Ctrl, kAsm330Int1DataReady);
+  if (!asm330ResetDevice()) {
+    g_asm330InitFailureCount++;
+    Serial.println("BOOT,ASM330,ERR,RESET_TIMEOUT");
+    printAsm330KeyRegisters("BOOT,ASM330,REGS_RESET_FAIL");
+    printAsm330InitState("ASM330,INIT,STATE");
+    return false;
+  }
+
+  if (!asm330UpdateRegisterBits(kAsm330RegCtrl9Xl, kAsm330Ctrl9XlDeviceConf, kAsm330Ctrl9XlDeviceConf) ||
+      !asm330UpdateRegisterBits(kAsm330RegCtrl3C, kAsm330Ctrl3CBduIfInc, kAsm330Ctrl3CBduIfInc) ||
+      !asm330UpdateRegisterBits(kAsm330RegCtrl4C, kAsm330Ctrl4CI2cDisable, kAsm330Ctrl4CI2cEnable) ||
+      !asm330WriteRegisterChecked(kAsm330RegCtrl1Xl, kAsm330Ctrl1Xl416Hz16g) ||
+      !asm330WriteRegisterChecked(kAsm330RegCtrl2G, kAsm330Ctrl2G416Hz2000dps) ||
+      !asm330WriteRegisterChecked(kAsm330RegInt1Ctrl, kAsm330Int1DataReady)) {
+    g_asm330InitFailureCount++;
+    Serial.println("BOOT,ASM330,ERR,I2C_WRITE_FAIL");
+    printAsm330KeyRegisters("BOOT,ASM330,REGS_WRITE_FAIL");
+    printAsm330InitState("ASM330,INIT,STATE");
+    return false;
+  }
+
   delay(5);
 
   g_asm330LastCtrl1Xl = asm330ReadRegister(kAsm330RegCtrl1Xl);
@@ -403,8 +463,9 @@ bool initAsm330() {
 
   const bool ctrl1Ok = g_asm330LastCtrl1Xl == kAsm330Ctrl1Xl416Hz16g;
   const bool ctrl2Ok = g_asm330LastCtrl2G == kAsm330Ctrl2G416Hz2000dps;
-  const bool ctrl3Ok = g_asm330LastCtrl3C == kAsm330Ctrl3CBduIfInc;
-  const bool ctrl4Ok = (g_asm330LastCtrl4C & kAsm330Ctrl4CI2cDisable) != 0U;
+  const bool ctrl3Ok = (g_asm330LastCtrl3C & kAsm330Ctrl3CBduIfInc) == kAsm330Ctrl3CBduIfInc &&
+                       (g_asm330LastCtrl3C & kAsm330Ctrl3CSwReset) == 0U;
+  const bool ctrl4Ok = (g_asm330LastCtrl4C & kAsm330Ctrl4CI2cDisable) == kAsm330Ctrl4CI2cEnable;
   const bool ctrl9Ok = (g_asm330LastCtrl9Xl & kAsm330Ctrl9XlDeviceConf) != 0U;
   const bool int1Ok = g_asm330LastInt1Ctrl == kAsm330Int1DataReady;
   if (!ctrl1Ok || !ctrl2Ok || !ctrl3Ok || !ctrl4Ok || !ctrl9Ok || !int1Ok) {
@@ -446,11 +507,6 @@ void serviceAsm330InitRetry() {
 
   Serial.printf("ASM330,INIT,ATTEMPT,%lu\n", static_cast<unsigned long>(g_asm330InitCycleCount + 1U));
   g_imuReady = initAsm330();
-  if (!g_imuReady) {
-    g_asm330LastInitSucceeded = false;
-    g_asm330InitFailureCount++;
-    printAsm330InitState("ASM330,INIT,STATE");
-  }
 }
 
 bool initTwai() {

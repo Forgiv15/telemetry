@@ -667,6 +667,8 @@ class TelemetryWindow(QMainWindow):
         self.asm_init_cycles_label = QLabel("--")
         self.asm_init_ok_label = QLabel("--")
         self.asm_init_fail_label = QLabel("--")
+        self.asm_addr_label = QLabel("--")
+        self.asm_ctrl3_label = QLabel("--")
         self.asm_ctrl4_label = QLabel("--")
         self.asm_ctrl9_label = QLabel("--")
         self.asm_init_event_label = QLabel(self.asm_init_event_text)
@@ -676,7 +678,9 @@ class TelemetryWindow(QMainWindow):
         fields_layout.addRow("Init cycles:", self.asm_init_cycles_label)
         fields_layout.addRow("Init OK count:", self.asm_init_ok_label)
         fields_layout.addRow("Init fail count:", self.asm_init_fail_label)
+        fields_layout.addRow("I2C address:", self.asm_addr_label)
         fields_layout.addRow("WHOAMI:", self.asm_whoami_label)
+        fields_layout.addRow("CTRL3_C:", self.asm_ctrl3_label)
         fields_layout.addRow("CTRL4_C:", self.asm_ctrl4_label)
         fields_layout.addRow("CTRL9_XL:", self.asm_ctrl9_label)
         fields_layout.addRow("IRQ count:", self.asm_irq_label)
@@ -971,7 +975,7 @@ class TelemetryWindow(QMainWindow):
             self.asm_raw_label.setText(line.split(",LAST_RAW,", 1)[1].strip())
             return
 
-        if "WHOAMI=" not in line and "READY=" not in line:
+        if "=" not in line:
             return
 
         for part in line.split(","):
@@ -1076,7 +1080,9 @@ class TelemetryWindow(QMainWindow):
         self.asm_init_cycles_label.setText(self.asm_fields.get("INIT_CYCLES", "--"))
         self.asm_init_ok_label.setText(self.asm_fields.get("INIT_OK", "--"))
         self.asm_init_fail_label.setText(self.asm_fields.get("INIT_FAIL", "--"))
+        self.asm_addr_label.setText(self.asm_fields.get("ADDR", "--"))
         self.asm_whoami_label.setText(self.asm_fields.get("WHOAMI", "--"))
+        self.asm_ctrl3_label.setText(self.asm_fields.get("CTRL3_C", "--"))
         self.asm_ctrl4_label.setText(self.asm_fields.get("CTRL4_C", "--"))
         self.asm_ctrl9_label.setText(self.asm_fields.get("CTRL9_XL", "--"))
         self.asm_irq_label.setText(self.asm_fields.get("IRQ", "--"))
