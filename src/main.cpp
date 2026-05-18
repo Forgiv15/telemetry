@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <SD.h>
 #include <SPI.h>
 #include <driver/twai.h>
@@ -11,9 +12,10 @@ namespace {
 constexpr uint32_t kSerialBaud = 921600;
 constexpr uint32_t kHeartbeatHalfPeriodMs = 25;
 constexpr uint32_t kSdErrorHalfPeriodMs = 250;
-constexpr uint32_t kAsm330DebugPeriodMs = 1000;
+constexpr uint32_t kAsm330DebugPeriodMs = 100;
+constexpr uint32_t kAsm330RetryPeriodMs = 250;
 constexpr uint32_t kTwaiStatusPeriodMs = 1000;
-constexpr uint32_t kAsm330StartupRetries = 5;
+constexpr uint32_t kAsm330StartupRetries = 20;
 constexpr uint32_t kHardStopLatchMs = 1000;
 constexpr float kHardStopThresholdG = 10.0f;
 
@@ -47,14 +49,21 @@ constexpr uint8_t kAsm330RegWhoAmI = 0x0F;
 constexpr uint8_t kAsm330RegCtrl1Xl = 0x10;
 constexpr uint8_t kAsm330RegCtrl2G = 0x11;
 constexpr uint8_t kAsm330RegCtrl3C = 0x12;
+constexpr uint8_t kAsm330RegCtrl4C = 0x13;
+constexpr uint8_t kAsm330RegCtrl9Xl = 0x18;
 constexpr uint8_t kAsm330RegStatus = 0x1E;
 constexpr uint8_t kAsm330RegOutTempL = 0x20;
 constexpr uint8_t kAsm330WhoAmIValue = 0x6B;
 
 constexpr uint8_t kAsm330Ctrl1Xl416Hz16g = 0x64;
 constexpr uint8_t kAsm330Ctrl2G416Hz2000dps = 0x6C;
-constexpr uint8_t kAsm330Ctrl3C = 0x44;
+constexpr uint8_t kAsm330Ctrl3CBduIfInc = 0x44;
+constexpr uint8_t kAsm330Ctrl4CI2cDisable = 0x04;
+constexpr uint8_t kAsm330Ctrl9XlDeviceConf = 0x02;
 constexpr uint8_t kAsm330Int1DataReady = 0x03;
+constexpr uint8_t kAsm330StatusAccelReady = 0x01;
+constexpr uint8_t kAsm330StatusGyroReady = 0x02;
+constexpr uint8_t kAsm330StatusAccelGyroReady = kAsm330StatusAccelReady | kAsm330StatusGyroReady;
 
 constexpr float kAccelScaleGPerLsb = 0.000488f;
 constexpr float kGyroScaleDpsPerLsb = 0.07f;
@@ -94,11 +103,23 @@ uint32_t g_asm330PinReadyCount = 0;
 uint32_t g_asm330FallbackPollCount = 0;
 uint32_t g_asm330AllZeroSampleCount = 0;
 uint32_t g_asm330ConsecutiveNoSampleCount = 0;
+uint32_t g_asm330InitCycleCount = 0;
+uint32_t g_asm330InitSuccessCount = 0;
+uint32_t g_asm330InitFailureCount = 0;
+uint32_t g_lastAsm330InitAttemptMs = 0;
+uint8_t g_asm330LastCtrl1Xl = 0;
+uint8_t g_asm330LastCtrl2G = 0;
+uint8_t g_asm330LastCtrl3C = 0;
 uint8_t g_asm330LastWhoAmI = 0;
 uint8_t g_asm330LastStatus = 0;
 uint8_t g_asm330LastRawBytes[14] = {};
+uint8_t g_asm330LastCtrl4C = 0;
+uint8_t g_asm330LastCtrl9Xl = 0;
+uint8_t g_asm330LastInt1Ctrl = 0;
 char g_serialCommandBuffer[64] = {};
 size_t g_serialCommandLength = 0;
+bool g_asm330InitRetryEnabled = false;
+bool g_asm330LastInitSucceeded = false;
 
 File g_logFile;
 
@@ -260,21 +281,47 @@ void printAsm330KeyRegisters(const char *prefix) {
   const uint8_t ctrl1Xl = asm330ReadRegister(kAsm330RegCtrl1Xl);
   const uint8_t ctrl2G = asm330ReadRegister(kAsm330RegCtrl2G);
   const uint8_t ctrl3C = asm330ReadRegister(kAsm330RegCtrl3C);
+  const uint8_t ctrl4C = asm330ReadRegister(kAsm330RegCtrl4C);
+  const uint8_t ctrl9Xl = asm330ReadRegister(kAsm330RegCtrl9Xl);
   const uint8_t status = asm330ReadRegister(kAsm330RegStatus);
 
   g_asm330LastWhoAmI = whoAmI;
   g_asm330LastStatus = status;
+  g_asm330LastCtrl1Xl = ctrl1Xl;
+  g_asm330LastCtrl2G = ctrl2G;
+  g_asm330LastCtrl3C = ctrl3C;
+  g_asm330LastCtrl4C = ctrl4C;
+  g_asm330LastCtrl9Xl = ctrl9Xl;
+  g_asm330LastInt1Ctrl = int1Ctrl;
 
   Serial.printf(
-      "%s,WHOAMI=0x%02X,CTRL1_XL=0x%02X,CTRL2_G=0x%02X,CTRL3_C=0x%02X,INT1_CTRL=0x%02X,STATUS=0x%02X,DRDY_PIN=%d\n",
+      "%s,WHOAMI=0x%02X,CTRL1_XL=0x%02X,CTRL2_G=0x%02X,CTRL3_C=0x%02X,CTRL4_C=0x%02X,CTRL9_XL=0x%02X,INT1_CTRL=0x%02X,STATUS=0x%02X,DRDY_PIN=%d\n",
       prefix,
       whoAmI,
       ctrl1Xl,
       ctrl2G,
       ctrl3C,
+      ctrl4C,
+      ctrl9Xl,
       int1Ctrl,
       status,
       digitalRead(kAsm330DrdyPin));
+}
+
+void printAsm330InitState(const char *prefix) {
+  Serial.printf(
+      "%s,READY=%u,RETRY=%u,LAST_OK=%u,INIT_CYCLES=%lu,INIT_OK=%lu,INIT_FAIL=%lu,WHOAMI=0x%02X,CTRL4_C=0x%02X,CTRL9_XL=0x%02X\n",
+      prefix,
+      g_imuReady ? 1U : 0U,
+      g_asm330InitRetryEnabled ? 1U : 0U,
+      g_asm330LastInitSucceeded ? 1U : 0U,
+      static_cast<unsigned long>(g_asm330InitCycleCount),
+      static_cast<unsigned long>(g_asm330InitSuccessCount),
+      static_cast<unsigned long>(g_asm330InitFailureCount),
+      g_asm330LastWhoAmI,
+      g_asm330LastCtrl3C,
+      g_asm330LastCtrl4C,
+      g_asm330LastCtrl9Xl);
 }
 
 void printAsm330DebugSnapshot(const char *prefix) {
@@ -301,6 +348,10 @@ void printAsm330DebugSnapshot(const char *prefix) {
 }
 
 bool initAsm330() {
+  g_asm330InitCycleCount++;
+  g_lastAsm330InitAttemptMs = millis();
+  g_imuDataReady = false;
+
   pinMode(kAsm330DrdyPin, INPUT);
   if (kAsm330CsPin >= 0) {
     pinMode(kAsm330CsPin, OUTPUT);
@@ -335,17 +386,71 @@ bool initAsm330() {
     return false;
   }
 
-  asm330WriteRegister(kAsm330RegCtrl3C, kAsm330Ctrl3C);
+  asm330WriteRegister(kAsm330RegCtrl3C, kAsm330Ctrl3CBduIfInc);
+  asm330WriteRegister(kAsm330RegCtrl4C, kAsm330Ctrl4CI2cDisable);
+  asm330WriteRegister(kAsm330RegCtrl9Xl, kAsm330Ctrl9XlDeviceConf);
   asm330WriteRegister(kAsm330RegCtrl1Xl, kAsm330Ctrl1Xl416Hz16g);
   asm330WriteRegister(kAsm330RegCtrl2G, kAsm330Ctrl2G416Hz2000dps);
   asm330WriteRegister(kAsm330RegInt1Ctrl, kAsm330Int1DataReady);
   delay(5);
 
+  g_asm330LastCtrl1Xl = asm330ReadRegister(kAsm330RegCtrl1Xl);
+  g_asm330LastCtrl2G = asm330ReadRegister(kAsm330RegCtrl2G);
+  g_asm330LastCtrl3C = asm330ReadRegister(kAsm330RegCtrl3C);
+  g_asm330LastCtrl4C = asm330ReadRegister(kAsm330RegCtrl4C);
+  g_asm330LastCtrl9Xl = asm330ReadRegister(kAsm330RegCtrl9Xl);
+  g_asm330LastInt1Ctrl = asm330ReadRegister(kAsm330RegInt1Ctrl);
+
+  const bool ctrl1Ok = g_asm330LastCtrl1Xl == kAsm330Ctrl1Xl416Hz16g;
+  const bool ctrl2Ok = g_asm330LastCtrl2G == kAsm330Ctrl2G416Hz2000dps;
+  const bool ctrl3Ok = g_asm330LastCtrl3C == kAsm330Ctrl3CBduIfInc;
+  const bool ctrl4Ok = (g_asm330LastCtrl4C & kAsm330Ctrl4CI2cDisable) != 0U;
+  const bool ctrl9Ok = (g_asm330LastCtrl9Xl & kAsm330Ctrl9XlDeviceConf) != 0U;
+  const bool int1Ok = g_asm330LastInt1Ctrl == kAsm330Int1DataReady;
+  if (!ctrl1Ok || !ctrl2Ok || !ctrl3Ok || !ctrl4Ok || !ctrl9Ok || !int1Ok) {
+    g_asm330LastInitSucceeded = false;
+    g_asm330InitFailureCount++;
+    Serial.printf(
+        "BOOT,ASM330,ERR,CFG_VERIFY,CTRL1_XL=0x%02X,CTRL2_G=0x%02X,CTRL3_C=0x%02X,CTRL4_C=0x%02X,CTRL9_XL=0x%02X,INT1_CTRL=0x%02X\n",
+        g_asm330LastCtrl1Xl,
+        g_asm330LastCtrl2G,
+        g_asm330LastCtrl3C,
+        g_asm330LastCtrl4C,
+        g_asm330LastCtrl9Xl,
+        g_asm330LastInt1Ctrl);
+    printAsm330KeyRegisters("BOOT,ASM330,REGS_CFG_FAIL");
+    printAsm330InitState("ASM330,INIT,STATE");
+    return false;
+  }
+
   printAsm330KeyRegisters("BOOT,ASM330,REGS_AFTER_CFG");
 
   attachInterrupt(digitalPinToInterrupt(kAsm330DrdyPin), onAsm330DataReady, RISING);
+  g_asm330LastInitSucceeded = true;
+  g_asm330InitSuccessCount++;
+  g_asm330InitRetryEnabled = false;
+  printAsm330InitState("ASM330,INIT,STATE");
   Serial.println("BOOT,ASM330,OK,ODR=416HZ,ACC=16G,GYRO=2000DPS");
   return true;
+}
+
+void serviceAsm330InitRetry() {
+  if (!g_asm330InitRetryEnabled || g_imuReady) {
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  if ((nowMs - g_lastAsm330InitAttemptMs) < kAsm330RetryPeriodMs) {
+    return;
+  }
+
+  Serial.printf("ASM330,INIT,ATTEMPT,%lu\n", static_cast<unsigned long>(g_asm330InitCycleCount + 1U));
+  g_imuReady = initAsm330();
+  if (!g_imuReady) {
+    g_asm330LastInitSucceeded = false;
+    g_asm330InitFailureCount++;
+    printAsm330InitState("ASM330,INIT,STATE");
+  }
 }
 
 bool initTwai() {
@@ -486,6 +591,16 @@ bool readAsm330Sample(ImuSample &sample) {
     return false;
   }
 
+  g_asm330LastStatus = asm330ReadRegister(kAsm330RegStatus);
+  const bool statusReady = (g_asm330LastStatus & kAsm330StatusAccelGyroReady) == kAsm330StatusAccelGyroReady;
+  if (!statusReady) {
+    if (interruptReady || pinReady) {
+      g_imuDataReady = false;
+    }
+    g_lastImuPollUs = nowUs;
+    return false;
+  }
+
   g_asm330ReadAttemptCount++;
   if (interruptReady) {
     g_asm330InterruptSourceCount++;
@@ -499,8 +614,6 @@ bool readAsm330Sample(ImuSample &sample) {
 
   g_imuDataReady = false;
   g_lastImuPollUs = nowUs;
-
-  g_asm330LastStatus = asm330ReadRegister(kAsm330RegStatus);
 
   uint8_t rawBytes[14] = {};
   asm330ReadRegisters(kAsm330RegOutTempL, rawBytes, sizeof(rawBytes));
@@ -584,6 +697,29 @@ void handleAsm330SerialCommand(const char *line) {
     return;
   }
 
+  if (strcmp(line, "ASMINIT") == 0) {
+    g_asm330InitRetryEnabled = true;
+    g_imuReady = false;
+    g_asm330LastInitSucceeded = false;
+    g_lastAsm330InitAttemptMs = 0;
+    Serial.println("ASM330,INIT,START");
+    printAsm330InitState("ASM330,INIT,STATE");
+    return;
+  }
+
+  if (strcmp(line, "ASMINITSTOP") == 0) {
+    g_asm330InitRetryEnabled = false;
+    Serial.println("ASM330,INIT,STOP");
+    printAsm330InitState("ASM330,INIT,STATE");
+    return;
+  }
+
+  if (strcmp(line, "ASMSTATE") == 0) {
+    printAsm330InitState("ASM330,INIT,STATE");
+    printAsm330KeyRegisters("ASM330,INIT,REGS");
+    return;
+  }
+
   if (strncmp(line, "ASMREG ", 7) == 0) {
     const unsigned long reg = strtoul(line + 7, nullptr, 16);
     if (reg <= 0x7FUL) {
@@ -596,6 +732,8 @@ void handleAsm330SerialCommand(const char *line) {
   Serial.printf("ASMDBG,ERR,UNKNOWN_CMD,%s\n", line);
 }
 
+void handleTxSerialCommand(const char *line);
+
 void serviceSerialCommands() {
   while (Serial.available() > 0) {
     const char ch = static_cast<char>(Serial.read());
@@ -605,7 +743,11 @@ void serviceSerialCommands() {
       }
 
       g_serialCommandBuffer[g_serialCommandLength] = '\0';
-      handleAsm330SerialCommand(g_serialCommandBuffer);
+      if (strncmp(g_serialCommandBuffer, "TX,", 3) == 0) {
+        handleTxSerialCommand(g_serialCommandBuffer);
+      } else {
+        handleAsm330SerialCommand(g_serialCommandBuffer);
+      }
       g_serialCommandLength = 0U;
       continue;
     }
@@ -752,20 +894,21 @@ void serviceMcpRx() {
   }
 }
 
-void sendTwaiFrame(const uint16_t identifier, const uint8_t *payload, const uint8_t length) {
+void sendTwaiFrameRaw(const uint32_t identifier, const bool extended, const uint8_t *payload, const uint8_t length) {
   if (!g_twaiReady) {
     return;
   }
 
   twai_message_t message = {};
   message.identifier = identifier;
-  message.extd = 0;
+  message.extd = extended ? 1 : 0;
   message.rtr = 0;
   message.ss = 0;
   message.self = 0;
   message.dlc_non_comp = 0;
-  message.data_length_code = length;
-  memcpy(message.data, payload, length);
+  const uint8_t clampedLength = (length <= 8U) ? length : 8U;
+  message.data_length_code = clampedLength;
+  memcpy(message.data, payload, clampedLength);
 
   const esp_err_t result = twai_transmit(&message, 0);
   if (result != ESP_OK && result != ESP_ERR_TIMEOUT) {
@@ -773,20 +916,173 @@ void sendTwaiFrame(const uint16_t identifier, const uint8_t *payload, const uint
   }
 }
 
-void sendMcpFrame(const uint16_t identifier, const uint8_t *payload, const uint8_t length) {
+void sendMcpFrameRaw(const uint32_t identifier, const bool extended, const uint8_t *payload, const uint8_t length) {
   if (!g_mcpReady) {
     return;
   }
 
   can_frame frame = {};
-  frame.can_id = identifier;
-  frame.can_dlc = length;
-  memcpy(frame.data, payload, length);
+  const uint8_t clampedLength = (length <= 8U) ? length : 8U;
+  frame.can_id = extended ? ((identifier & CAN_EFF_MASK) | CAN_EFF_FLAG) : (identifier & CAN_SFF_MASK);
+  frame.can_dlc = clampedLength;
+  memcpy(frame.data, payload, clampedLength);
 
   const MCP2515::ERROR result = mcp2515.sendMessage(&frame);
   if (result != MCP2515::ERROR_OK && result != MCP2515::ERROR_ALLTXBUSY) {
     Serial.printf("ERR,MCP_TX,%d\n", static_cast<int>(result));
   }
+}
+
+void sendTwaiFrame(const uint16_t identifier, const uint8_t *payload, const uint8_t length) {
+  sendTwaiFrameRaw(identifier, false, payload, length);
+}
+
+void sendMcpFrame(const uint16_t identifier, const uint8_t *payload, const uint8_t length) {
+  sendMcpFrameRaw(identifier, false, payload, length);
+}
+
+bool parseUIntToken(const char *token, const int base, unsigned long &value) {
+  if (token == nullptr || token[0] == '\0') {
+    return false;
+  }
+
+  char *endPtr = nullptr;
+  const unsigned long parsed = strtoul(token, &endPtr, base);
+  if ((endPtr == token) || (*endPtr != '\0')) {
+    return false;
+  }
+
+  value = parsed;
+  return true;
+}
+
+bool parseHexByteToken(const char *token, uint8_t &value) {
+  unsigned long parsed = 0;
+  if (!parseUIntToken(token, 16, parsed) || parsed > 0xFFUL) {
+    return false;
+  }
+
+  value = static_cast<uint8_t>(parsed);
+  return true;
+}
+
+bool parsePayloadList(char *payloadText, const uint8_t expectedLength, uint8_t *payloadOut) {
+  if (expectedLength == 0U) {
+    return true;
+  }
+
+  if (payloadText == nullptr || payloadText[0] == '\0') {
+    return false;
+  }
+
+  uint8_t parsedLength = 0;
+  char *token = strtok(payloadText, " ");
+  while (token != nullptr) {
+    if (parsedLength >= expectedLength) {
+      return false;
+    }
+
+    uint8_t value = 0;
+    if (!parseHexByteToken(token, value)) {
+      return false;
+    }
+
+    payloadOut[parsedLength++] = value;
+    token = strtok(nullptr, " ");
+  }
+
+  return parsedLength == expectedLength;
+}
+
+void handleTxSerialCommand(const char *line) {
+  char commandBuffer[96] = {};
+  strncpy(commandBuffer, line, sizeof(commandBuffer) - 1U);
+
+  char *savePtr = nullptr;
+  char *token = strtok_r(commandBuffer, ",", &savePtr);
+  if ((token == nullptr) || (strcmp(token, "TX") != 0)) {
+    Serial.println("CMD,ERR,TX_FORMAT");
+    return;
+  }
+
+  char *token2 = strtok_r(nullptr, ",", &savePtr);
+  if (token2 == nullptr) {
+    Serial.println("CMD,ERR,TX_FORMAT");
+    return;
+  }
+
+  char busSelector = 'B';
+  char frameType = 'S';
+  char *idToken = nullptr;
+  char *dlcToken = nullptr;
+  char *payloadToken = nullptr;
+
+  if ((strcmp(token2, "S") == 0) || (strcmp(token2, "E") == 0)) {
+    frameType = token2[0];
+    idToken = strtok_r(nullptr, ",", &savePtr);
+    dlcToken = strtok_r(nullptr, ",", &savePtr);
+    payloadToken = strtok_r(nullptr, "", &savePtr);
+  } else {
+    busSelector = static_cast<char>(toupper(static_cast<unsigned char>(token2[0])));
+
+    char *frameToken = strtok_r(nullptr, ",", &savePtr);
+    idToken = strtok_r(nullptr, ",", &savePtr);
+    dlcToken = strtok_r(nullptr, ",", &savePtr);
+    payloadToken = strtok_r(nullptr, "", &savePtr);
+
+    if (frameToken == nullptr || ((strcmp(frameToken, "S") != 0) && (strcmp(frameToken, "E") != 0))) {
+      Serial.println("CMD,ERR,TX_FRAME_TYPE");
+      return;
+    }
+    frameType = frameToken[0];
+  }
+
+  if (idToken == nullptr || dlcToken == nullptr) {
+    Serial.println("CMD,ERR,TX_ARGS");
+    return;
+  }
+
+  unsigned long parsedId = 0;
+  if (!parseUIntToken(idToken, 16, parsedId)) {
+    Serial.println("CMD,ERR,TX_ID");
+    return;
+  }
+
+  unsigned long parsedDlc = 0;
+  if (!parseUIntToken(dlcToken, 10, parsedDlc) || parsedDlc > 8UL) {
+    Serial.println("CMD,ERR,TX_DLC");
+    return;
+  }
+
+  const bool extended = frameType == 'E';
+  if ((!extended && parsedId > 0x7FFUL) || (extended && parsedId > 0x1FFFFFFFUL)) {
+    Serial.println("CMD,ERR,TX_ID_RANGE");
+    return;
+  }
+
+  uint8_t payload[8] = {};
+  if (parsedDlc > 0UL) {
+    if (!parsePayloadList(payloadToken, static_cast<uint8_t>(parsedDlc), payload)) {
+      Serial.println("CMD,ERR,TX_PAYLOAD");
+      return;
+    }
+  }
+
+  const bool sendTwai = (busSelector == '1') || (busSelector == 'A') || (busSelector == 'B');
+  const bool sendMcp = (busSelector == '2') || (busSelector == 'B');
+  if (!sendTwai && !sendMcp) {
+    Serial.println("CMD,ERR,TX_BUS");
+    return;
+  }
+
+  if (sendTwai) {
+    sendTwaiFrameRaw(static_cast<uint32_t>(parsedId), extended, payload, static_cast<uint8_t>(parsedDlc));
+  }
+  if (sendMcp) {
+    sendMcpFrameRaw(static_cast<uint32_t>(parsedId), extended, payload, static_cast<uint8_t>(parsedDlc));
+  }
+
+  Serial.printf("CMD,OK,TX,%c,%c,%lX,%lu\n", busSelector, frameType, parsedId, parsedDlc);
 }
 
 void publishImuToCan(const ImuSample &sample) {
@@ -906,6 +1202,11 @@ void setup() {
   g_sdReady = initSdCard();
   g_sdError = !g_sdReady;
   g_imuReady = initAsm330();
+  if (!g_imuReady) {
+    g_asm330LastInitSucceeded = false;
+    g_asm330InitFailureCount++;
+    printAsm330InitState("ASM330,INIT,STATE");
+  }
 
   if (g_recordingRequested && g_sdReady && !g_sdError) {
     openLogFile();
@@ -926,6 +1227,7 @@ void loop() {
   serviceTwaiRx();
   serviceTwaiStatus();
   serviceMcpRx();
+  serviceAsm330InitRetry();
   serviceAsm330Debug();
 
   ImuSample sample = {};

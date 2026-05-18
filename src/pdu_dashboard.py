@@ -21,27 +21,33 @@ UPDATE_RATE_HZ = 20
 HISTORY_LENGTH = HISTORY_SECONDS * UPDATE_RATE_HZ
 WATERFALL_MAX_LINES = 500
 
-CAN_ID_CONTROL = 0x400
-CAN_ID_TELEM_SUMMARY = 0x410
-CAN_ID_TELEM_EXTRA = 0x411
+CAN_ID_CONTROL_MASK = 0x080
+CAN_ID_CONTROL = 0x200
+CAN_ID_TELEM_SUMMARY = 0x700
+CAN_ID_TELEM_EXTRA = 0x701
+CAN_ID_ECU_RAW_DEBUG = 0x702
+CONTROL_WATERFALL_CAN_IDS = {
+    CAN_ID_CONTROL_MASK,
+    CAN_ID_CONTROL,
+}
 
 # Debug/verbose telemetry (only when debug flag is armed)
-CAN_ID_EFUSE_BASE = 0x600
+CAN_ID_EFUSE_BASE = 0x710
 CAN_ID_EFUSE_LAST = CAN_ID_EFUSE_BASE + EFUSE_COUNT - 1
-CAN_ID_ADC_BASE = 0x610
+CAN_ID_ADC_BASE = 0x720
 CAN_ID_ADC_LAST = CAN_ID_ADC_BASE + EFUSE_COUNT - 1
-CAN_ID_TEMP_BASE = 0x618
+CAN_ID_TEMP_BASE = 0x730
 CAN_ID_TEMP_LAST = CAN_ID_TEMP_BASE + EFUSE_COUNT - 1
-CAN_ID_MCU = 0x620
-CAN_ID_ERR_DETAIL_BASE = 0x630
+CAN_ID_MCU = 0x740
+CAN_ID_ERR_DETAIL_BASE = 0x750
 CAN_ID_ERR_DETAIL_LAST = CAN_ID_ERR_DETAIL_BASE + 7
-CAN_ID_I2C_SCAN_BASE = 0x640
+CAN_ID_I2C_SCAN_BASE = 0x760
 CAN_ID_I2C_SCAN_LAST = CAN_ID_I2C_SCAN_BASE + 3
-CAN_ID_PMBUS_DBG_META = 0x660
-CAN_ID_PMBUS_DBG_DATA = 0x661
-CAN_ID_PMBUS_DBG_EXT = 0x662
-CAN_ID_RETRY_MODE_STAT = 0x690
-CAN_ID_ADC_REF_STAT = 0x691  # Existing constant
+CAN_ID_PMBUS_DBG_META = 0x770
+CAN_ID_PMBUS_DBG_DATA = 0x771
+CAN_ID_PMBUS_DBG_EXT = 0x772
+CAN_ID_RETRY_MODE_STAT = 0x790
+CAN_ID_ADC_REF_STAT = 0x791  # Existing constant
 
 CONTROL_MAGIC = 0xA5
 CONTROL_OP_OUTPUT = 0x01
@@ -49,7 +55,21 @@ CONTROL_OP_RETRY_MODE = 0x02
 CONTROL_OP_CLEAR_FAULTS = 0x03
 CONTROL_OP_ADC_REF = 0x04
 CONTROL_OP_NOP = 0x00
-CONTROL_FLAG_DEBUG = 0x01
+CONTROL_FLAG_DEBUG = 0x04
+OVERRIDE_FLAG_ARMED = 0x01
+OVERRIDE_FLAG_START_ON = 0x02
+CONTROL_STATE_FLAG_DEBUG_ACTIVE = 0x01
+CONTROL_STATE_FLAG_ECU_FRESH = 0x02
+CONTROL_STATE_FLAG_OVERRIDE_FRESH = 0x04
+CONTROL_STATE_FLAG_OVERRIDE_ARMED = 0x08
+CONTROL_STATE_FLAG_OVERRIDE_ACTIVE = 0x10
+CONTROL_STATE_FLAG_SAFETY_BLOCKED = 0x20
+CONTROL_STATE_FLAG_HYBRID_LATCHED = 0x40
+CONTROL_STATE_FLAG_START_ON = 0x80
+ECU_RAW_FLAG_SEEN = 0x01
+ECU_RAW_FLAG_FRESH = 0x02
+ECU_RAW_FLAG_BYTE1 = 0x04
+ECU_RAW_FLAG_DLC_OK = 0x08
 
 EFUSE_NAMES = [
     "Hybrid",
@@ -63,6 +83,7 @@ EFUSE_NAMES = [
 ]
 
 OUTPUT_SWITCH_NAMES = EFUSE_NAMES + ["Other Fused"]
+FORCED_START_OUTPUT_INDEX = EFUSE_COUNT
 
 RETRY_MODE_NAMES = {
     1: "Fast SC Retry",
@@ -203,6 +224,18 @@ temp_avg_c = 0.0
 temp_peak_c = 0.0
 err_flags = 0
 debug_active = 0
+control_state_flags = 0
+requested_output_mask = 0
+applied_output_mask = 0
+maxxecu_output_mask = 0
+dashboard_output_mask = 0
+ecu_raw_flags = 0
+ecu_raw_decoded_mask = 0
+ecu_raw_requested_mask = 0
+ecu_raw_byte0 = 0
+ecu_raw_byte1 = 0
+ecu_raw_dlc = 0
+ecu_raw_rx_count = 0
 
 active_error_details = {}
 i2c_scan_blocks = {}
@@ -285,29 +318,15 @@ def send_can_standard_frame(can_id, data_bytes):
     return send_serial_line(f"TX,S,{can_id:03X},{len(data_bytes)},{payload}")
 
 
-def send_control_frame(opcode, param0=0, param1=0, debug=False):
-    flags = CONTROL_FLAG_DEBUG if debug else 0
-    return send_can_standard_frame(CAN_ID_CONTROL, [opcode & 0xFF, param0 & 0xFF, param1 & 0xFF, flags, CONTROL_MAGIC])
-
-
-def send_output_control(channel_index, enabled, debug=False):
-    return send_control_frame(CONTROL_OP_OUTPUT, channel_index, 1 if enabled else 0, debug)
-
-
-def send_retry_mode_control(mode, debug=False):
-    return send_control_frame(CONTROL_OP_RETRY_MODE, mode & 0xFF, 0, debug)
-
-
-def send_fault_clear_command(channel_index=0xFF, debug=False):
-    return send_control_frame(CONTROL_OP_CLEAR_FAULTS, channel_index & 0xFF, 0, debug)
-
-
-def send_adc_reference_control(reference, debug=False):
-    return send_control_frame(CONTROL_OP_ADC_REF, reference & 0xFF, 0, debug)
-
-
-def send_debug_pulse():
-    return send_control_frame(CONTROL_OP_NOP, 0, 0, debug=True)
+def send_dashboard_control_frame(mask, armed, start_enabled=True, opcode=CONTROL_OP_NOP, param0=0, param1=0, debug=False):
+    flags = 0
+    if armed:
+        flags |= OVERRIDE_FLAG_ARMED
+    if start_enabled:
+        flags |= OVERRIDE_FLAG_START_ON
+    if debug:
+        flags |= CONTROL_FLAG_DEBUG
+    return send_can_standard_frame(CAN_ID_CONTROL, [mask & 0xFF, flags, opcode & 0xFF, param0 & 0xFF, param1 & 0xFF, CONTROL_MAGIC])
 
 
 def parse_bridge_can_line(line):
@@ -360,6 +379,10 @@ def decode_can_frame(frame):
     global cml_status, temperature_c, active_retry_mode, retry_mode_applied
     global active_adc_reference, adc_reference_applied
     global sum_current_da, vin_avg_mv, temp_avg_c, temp_peak_c, err_flags, debug_active
+    global control_state_flags, requested_output_mask, applied_output_mask
+    global maxxecu_output_mask, dashboard_output_mask
+    global ecu_raw_flags, ecu_raw_decoded_mask, ecu_raw_requested_mask
+    global ecu_raw_byte0, ecu_raw_byte1, ecu_raw_dlc, ecu_raw_rx_count
 
     can_id = frame["can_id"]
     data = frame["data"]
@@ -387,7 +410,28 @@ def decode_can_frame(frame):
                 temp_peak_raw -= 0x10000
             temp_peak_c = temp_peak_raw / 10.0
             system_flags = data[2]
-            debug_active = data[3]
+            if len(data) >= 8:
+                control_state_flags = data[3]
+                debug_active = 1 if (control_state_flags & CONTROL_STATE_FLAG_DEBUG_ACTIVE) else 0
+                requested_output_mask = data[4]
+                applied_output_mask = data[5]
+                maxxecu_output_mask = data[6]
+                dashboard_output_mask = data[7]
+            else:
+                control_state_flags = CONTROL_STATE_FLAG_DEBUG_ACTIVE if data[3] else 0
+                debug_active = data[3]
+
+        elif can_id == CAN_ID_ECU_RAW_DEBUG:
+            if len(data) < 8:
+                return
+
+            ecu_raw_flags = data[0]
+            ecu_raw_decoded_mask = data[1]
+            ecu_raw_byte0 = data[2]
+            ecu_raw_byte1 = data[3]
+            ecu_raw_dlc = data[4]
+            ecu_raw_rx_count = data[5] | (data[6] << 8)
+            ecu_raw_requested_mask = data[7]
 
         elif CAN_ID_EFUSE_BASE <= can_id <= CAN_ID_EFUSE_LAST:
             if len(data) < 8:
@@ -725,11 +769,29 @@ class PDUDashboard:
         self.page_index = 0
         self.serial_port_var = tk.StringVar(value=SERIAL_PORT)
         self.debug_enabled_var = tk.BooleanVar(value=False)
+        self.manual_override_var = tk.BooleanVar(value=False)
         self.last_debug_keepalive = 0.0
+        self.last_override_keepalive = 0.0
+        self.last_pmbus_trace_render = ()
+        self.manual_override_mask = 0
+        self.manual_override_start_enabled = True
+        self.latest_control_state_flags = 0
+        self.latest_requested_output_mask = 0
+        self.latest_applied_output_mask = 0
+        self.latest_maxxecu_output_mask = 0
+        self.latest_dashboard_output_mask = 0
+        self.latest_ecu_raw_flags = 0
+        self.latest_ecu_raw_decoded_mask = 0
+        self.latest_ecu_raw_requested_mask = 0
+        self.latest_ecu_raw_byte0 = 0
+        self.latest_ecu_raw_byte1 = 0
+        self.latest_ecu_raw_dlc = 0
+        self.latest_ecu_raw_rx_count = 0
 
         self.build_menu()
         self.build_serial_panel()
         self.build_output_controls()
+        self.build_main_summary()
 
         self.build_top()
         self.build_dashboard_flags()
@@ -739,6 +801,24 @@ class PDUDashboard:
         self.refresh_ports()
 
         self.update_gui()
+
+    def send_dashboard_frame(self, opcode=CONTROL_OP_NOP, param0=0, param1=0, debug=None, armed=None, mask=None, start_enabled=None):
+        if armed is None:
+            armed = bool(self.manual_override_var.get())
+
+        if mask is None:
+            mask = self.manual_override_mask if armed else self.latest_requested_output_mask
+
+        if start_enabled is None:
+            if armed:
+                start_enabled = self.manual_override_start_enabled
+            else:
+                start_enabled = (self.latest_control_state_flags & CONTROL_STATE_FLAG_START_ON) != 0
+
+        if debug is None:
+            debug = bool(self.debug_enabled_var.get())
+
+        return send_dashboard_control_frame(mask, armed, start_enabled, opcode, param0, param1, debug)
 
     def build_menu(self):
         menu_bar = tk.Menu(self.root)
@@ -838,30 +918,89 @@ class PDUDashboard:
             lbl.grid(row=0, column=i, padx=2)
             self.sys_labels.append(lbl)
 
+    def build_main_summary(self):
+        summary_frame = tk.LabelFrame(self.root, text="System Summary")
+        summary_frame.pack(fill="x", pady=5)
+
+        self.main_shunt_label = tk.Label(summary_frame, text="Shunt: 0 mA", width=18, anchor="w")
+        self.main_shunt_label.grid(row=0, column=0, padx=6, pady=2, sticky="w")
+
+        self.main_vin_label = tk.Label(summary_frame, text="VIN avg: 0 mV", width=18, anchor="w")
+        self.main_vin_label.grid(row=0, column=1, padx=6, pady=2, sticky="w")
+
+        self.main_sum_current_label = tk.Label(summary_frame, text="Sum I: 0.0 A", width=18, anchor="w")
+        self.main_sum_current_label.grid(row=0, column=2, padx=6, pady=2, sticky="w")
+
+        self.main_temp_label = tk.Label(summary_frame, text="Temp avg: 0.0 C  peak: 0.0 C", width=28, anchor="w")
+        self.main_temp_label.grid(row=0, column=3, padx=6, pady=2, sticky="w")
+
     def build_output_controls(self):
-        control_frame = tk.LabelFrame(self.root, text="Output Control")
+        control_frame = tk.LabelFrame(self.root, text="Output Monitor / Manual Override")
         control_frame.pack(fill="x", pady=5)
+
+        status_frame = tk.Frame(control_frame)
+        status_frame.grid(row=0, column=0, columnspan=5, sticky="w", padx=3, pady=3)
+
+        tk.Checkbutton(
+            status_frame,
+            text="Manual Override",
+            variable=self.manual_override_var,
+            command=self.on_manual_override_toggled,
+        ).pack(side="left", padx=(0, 8))
+
+        self.output_source_label = tk.Label(status_frame, text="Source: No fresh command", anchor="w")
+        self.output_source_label.pack(side="left", padx=4)
+
+        self.output_mask_label = tk.Label(status_frame, text="Req 0x00  App 0x00  Pending 0x00", anchor="w")
+        self.output_mask_label.pack(side="left", padx=8)
+
+        desired_frame = tk.Frame(control_frame)
+        desired_frame.grid(row=1, column=0, columnspan=5, sticky="w", padx=3, pady=2)
+
+        tk.Label(desired_frame, text="MCU Desired:").grid(row=0, column=0, padx=(0, 4), sticky="w")
+        self.mcu_desired_labels = []
+        for index, name in enumerate(EFUSE_NAMES):
+            lbl = tk.Label(desired_frame, text=name, width=7, relief="groove", bg="light gray")
+            lbl.grid(row=0, column=index + 1, padx=2, pady=1)
+            self.mcu_desired_labels.append(lbl)
+
+        tk.Label(desired_frame, text="Applied:").grid(row=1, column=0, padx=(0, 4), sticky="w")
+        self.mcu_applied_labels = []
+        for index, name in enumerate(EFUSE_NAMES):
+            lbl = tk.Label(desired_frame, text=name, width=7, relief="groove", bg="light gray")
+            lbl.grid(row=1, column=index + 1, padx=2, pady=1)
+            self.mcu_applied_labels.append(lbl)
+
+        tk.Label(desired_frame, text="ECU Raw 0x080:").grid(row=2, column=0, padx=(0, 4), sticky="w")
+        self.ecu_raw_labels = []
+        for index, name in enumerate(EFUSE_NAMES):
+            lbl = tk.Label(desired_frame, text=name, width=7, relief="groove", bg="light gray")
+            lbl.grid(row=2, column=index + 1, padx=2, pady=1)
+            self.ecu_raw_labels.append(lbl)
+
+        self.raw_ecu_status_label = tk.Label(control_frame, text="0x080 dbg: seen=0 fresh=0 byte1=0 dlc=0 raw=0x00/0x00 count=0", anchor="w")
+        self.raw_ecu_status_label.grid(row=2, column=0, columnspan=5, sticky="w", padx=3, pady=2)
 
         self.output_switch_vars = []
         self.output_switch_buttons = []
 
         for index, name in enumerate(OUTPUT_SWITCH_NAMES):
-            var = tk.IntVar(value=1)
+            var = tk.IntVar(value=1 if index == FORCED_START_OUTPUT_INDEX else 0)
             btn = tk.Checkbutton(
                 control_frame,
-                text=name,
+                text="START (always on)" if index == FORCED_START_OUTPUT_INDEX else name,
                 variable=var,
                 indicatoron=False,
                 width=14,
                 command=lambda idx=index: self.on_output_switch_toggled(idx),
             )
-            btn.grid(row=index // 5, column=index % 5, padx=3, pady=3, sticky="ew")
+            btn.grid(row=3 + (index // 5), column=index % 5, padx=3, pady=3, sticky="ew")
             self.output_switch_vars.append(var)
             self.output_switch_buttons.append(btn)
 
         self.retry_mode_var = tk.IntVar(value=2)
         retry_frame = tk.LabelFrame(control_frame, text="TPS25990 Retry Mode")
-        retry_frame.grid(row=2, column=0, columnspan=5, sticky="w", padx=3, pady=4)
+        retry_frame.grid(row=5, column=0, columnspan=5, sticky="w", padx=3, pady=4)
 
         for column, mode in enumerate((1, 2, 3)):
             tk.Radiobutton(
@@ -884,7 +1023,7 @@ class PDUDashboard:
 
         self.adc_reference_var = tk.IntVar(value=0)
         adc_ref_frame = tk.LabelFrame(control_frame, text="ADC Reference")
-        adc_ref_frame.grid(row=3, column=0, columnspan=5, sticky="w", padx=3, pady=4)
+        adc_ref_frame.grid(row=6, column=0, columnspan=5, sticky="w", padx=3, pady=4)
 
         for column, reference in enumerate((0, 1)):
             tk.Radiobutton(
@@ -901,35 +1040,101 @@ class PDUDashboard:
         self.refresh_output_switch_colors()
 
     def refresh_output_switch_colors(self):
+        requested_mask = self.latest_requested_output_mask
+        applied_mask = self.latest_applied_output_mask
+        manual_override = self.manual_override_var.get()
+        start_on = (self.latest_control_state_flags & CONTROL_STATE_FLAG_START_ON) != 0
+
+        for index in range(EFUSE_COUNT):
+            desired_active = ((requested_mask >> index) & 0x01) != 0
+            applied_active = ((applied_mask >> index) & 0x01) != 0
+            raw_ecu_active = ((self.latest_ecu_raw_requested_mask >> index) & 0x01) != 0
+            self.mcu_desired_labels[index].config(bg="green" if desired_active else "red")
+            self.mcu_applied_labels[index].config(bg="green" if applied_active else "red")
+            self.ecu_raw_labels[index].config(bg="green" if raw_ecu_active else "red")
+
         for index, btn in enumerate(self.output_switch_buttons):
-            active = self.output_switch_vars[index].get() != 0
-            btn.config(bg="green" if active else "red", activebackground="green" if active else "red")
+            if index == FORCED_START_OUTPUT_INDEX:
+                if manual_override:
+                    self.output_switch_vars[index].set(1 if self.manual_override_start_enabled else 0)
+                    btn.config(state="normal")
+                else:
+                    self.output_switch_vars[index].set(1 if start_on else 0)
+                    btn.config(state="disabled", disabledforeground="black")
+                start_color = "green" if start_on else "red"
+                btn.config(bg=start_color, activebackground=start_color)
+                continue
+
+            if manual_override:
+                self.output_switch_vars[index].set((self.manual_override_mask >> index) & 0x01)
+                btn.config(state="normal")
+            else:
+                self.output_switch_vars[index].set((requested_mask >> index) & 0x01)
+                btn.config(state="disabled", disabledforeground="black")
+
+            requested = ((requested_mask >> index) & 0x01) != 0
+            applied = ((applied_mask >> index) & 0x01) != 0
+
+            if requested != applied:
+                color = "gold"
+            else:
+                color = "green" if applied else "red"
+
+            btn.config(bg=color, activebackground=color)
 
     def on_output_switch_toggled(self, index):
-        enabled = self.output_switch_vars[index].get() != 0
-        if not send_output_control(index, enabled):
-            self.output_switch_vars[index].set(0 if enabled else 1)
+        if index == FORCED_START_OUTPUT_INDEX:
+            if self.manual_override_var.get():
+                self.manual_override_start_enabled = self.output_switch_vars[index].get() != 0
+                if self.send_dashboard_frame(mask=self.manual_override_mask, armed=True, start_enabled=self.manual_override_start_enabled):
+                    self.last_override_keepalive = time.monotonic()
+            else:
+                self.output_switch_vars[index].set(1 if ((self.latest_control_state_flags & CONTROL_STATE_FLAG_START_ON) != 0) else 0)
+            self.refresh_output_switch_colors()
+            return
+
+        if not self.manual_override_var.get():
+            self.refresh_output_switch_colors()
+            return
+
+        bit = 1 << index
+        if self.output_switch_vars[index].get() != 0:
+            self.manual_override_mask |= bit
+        else:
+            self.manual_override_mask &= ~bit
+
+        if self.send_dashboard_frame(mask=self.manual_override_mask, armed=True, start_enabled=self.manual_override_start_enabled):
+            self.last_override_keepalive = time.monotonic()
+        self.refresh_output_switch_colors()
+
+    def on_manual_override_toggled(self):
+        if self.manual_override_var.get():
+            self.manual_override_mask = self.latest_requested_output_mask
+            self.manual_override_start_enabled = (self.latest_control_state_flags & CONTROL_STATE_FLAG_START_ON) != 0
+            if self.send_dashboard_frame(mask=self.manual_override_mask, armed=True, start_enabled=self.manual_override_start_enabled):
+                self.last_override_keepalive = time.monotonic()
+        else:
+            self.send_dashboard_frame(mask=self.manual_override_mask, armed=False, start_enabled=self.manual_override_start_enabled)
+            self.last_override_keepalive = 0.0
+
         self.refresh_output_switch_colors()
 
     def on_retry_mode_changed(self):
         mode = self.retry_mode_var.get()
-        if not send_retry_mode_control(mode):
+        if not self.send_dashboard_frame(opcode=CONTROL_OP_RETRY_MODE, param0=mode):
             return
 
     def on_clear_faults_clicked(self):
-        send_fault_clear_command(0xFF)
+        self.send_dashboard_frame(opcode=CONTROL_OP_CLEAR_FAULTS, param0=0xFF)
 
     def on_adc_reference_changed(self):
         reference = self.adc_reference_var.get()
-        if not send_adc_reference_control(reference):
+        if not self.send_dashboard_frame(opcode=CONTROL_OP_ADC_REF, param0=reference):
             return
 
     def on_debug_toggle(self):
         self.last_debug_keepalive = 0.0
-        if self.debug_enabled_var.get():
-            send_debug_pulse()
-        else:
-            send_control_frame(CONTROL_OP_NOP, 0, 0, debug=False)
+        self.send_dashboard_frame(debug=self.debug_enabled_var.get())
 
     def build_diagnostics_window(self):
         self.diag_window = tk.Toplevel(self.root)
@@ -937,6 +1142,7 @@ class PDUDashboard:
         self.diag_window.geometry("1100x700")
 
         self.build_mcu(self.diag_window)
+        self.build_pmbus_trace_panel(self.diag_window)
         self.build_serial_waterfall(self.diag_window)
 
         self.diag_window.protocol("WM_DELETE_WINDOW", self.diag_window.withdraw)
@@ -1039,6 +1245,12 @@ class PDUDashboard:
         )
         self.mcu_debug_detail_label.pack()
 
+        self.ecu_raw_debug_label = tk.Label(
+            mcu_frame,
+            text="0x080 raw: seen=0 fresh=0 byte1=0 dlc=0 raw=0x00/0x00 dec=0x00 req=0x00 count=0",
+        )
+        self.ecu_raw_debug_label.pack()
+
         error_list_frame = tk.LabelFrame(mcu_frame, text="Active Errors (1s TTL)")
         error_list_frame.pack(fill="x", padx=4, pady=4)
         self.error_listbox = tk.Listbox(error_list_frame, height=6)
@@ -1076,22 +1288,61 @@ class PDUDashboard:
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def build_serial_waterfall(self, parent):
-        waterfall_frame = tk.LabelFrame(parent, text="CAN/Serial Waterfall")
-        waterfall_frame.pack(fill="both", expand=True, padx=6, pady=6)
+        waterfall_container = tk.Frame(parent)
+        waterfall_container.pack(fill="both", expand=True, padx=6, pady=6)
+        waterfall_container.grid_columnconfigure(0, weight=1)
+        waterfall_container.grid_columnconfigure(1, weight=1)
+        waterfall_container.grid_rowconfigure(0, weight=1)
+
+        waterfall_frame = tk.LabelFrame(waterfall_container, text="CAN/Serial Waterfall")
+        waterfall_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
 
         self.waterfall_text = tk.Text(waterfall_frame, height=24, state="disabled")
         self.waterfall_text.pack(fill="both", expand=True)
 
-    def append_waterfall_line(self, text_line):
-        self.waterfall_text.configure(state="normal")
-        self.waterfall_text.insert("end", text_line + "\n")
+        control_frame = tk.LabelFrame(waterfall_container, text="Filtered Control CAN")
+        control_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
 
-        line_count = int(self.waterfall_text.index("end-1c").split(".")[0])
+        self.control_waterfall_text = tk.Text(control_frame, height=24, state="disabled")
+        self.control_waterfall_text.pack(fill="both", expand=True)
+
+    def build_pmbus_trace_panel(self, parent):
+        trace_frame = tk.LabelFrame(parent, text="PMBus Trace")
+        trace_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.pmbus_trace_text = tk.Text(trace_frame, height=10, state="disabled")
+        self.pmbus_trace_text.pack(fill="both", expand=True)
+
+    def refresh_pmbus_trace_panel(self, lines):
+        snapshot = tuple(lines)
+        if snapshot == self.last_pmbus_trace_render:
+            return
+
+        self.last_pmbus_trace_render = snapshot
+        self.pmbus_trace_text.configure(state="normal")
+        self.pmbus_trace_text.delete("1.0", "end")
+        if lines:
+            self.pmbus_trace_text.insert("1.0", "\n".join(lines))
+            self.pmbus_trace_text.see("end")
+        self.pmbus_trace_text.configure(state="disabled")
+
+    def append_text_waterfall_line(self, text_widget, text_line):
+        text_widget.configure(state="normal")
+        text_widget.insert("end", text_line + "\n")
+
+        line_count = int(text_widget.index("end-1c").split(".")[0])
         if line_count > WATERFALL_MAX_LINES:
-            self.waterfall_text.delete("1.0", f"{line_count - WATERFALL_MAX_LINES + 1}.0")
+            text_widget.delete("1.0", f"{line_count - WATERFALL_MAX_LINES + 1}.0")
 
-        self.waterfall_text.see("end")
-        self.waterfall_text.configure(state="disabled")
+        text_widget.see("end")
+        text_widget.configure(state="disabled")
+
+    def append_waterfall_line(self, text_line):
+        self.append_text_waterfall_line(self.waterfall_text, text_line)
+
+        frame = parse_bridge_can_line(text_line)
+        if frame is not None and frame["can_id"] in CONTROL_WATERFALL_CAN_IDS:
+            self.append_text_waterfall_line(self.control_waterfall_text, text_line)
 
     def prev_page(self):
         self.page_index = (self.page_index - 1) % 4
@@ -1117,7 +1368,7 @@ class PDUDashboard:
         if self.debug_enabled_var.get():
             now = time.monotonic()
             if now - self.last_debug_keepalive >= 0.5:
-                if send_debug_pulse():
+                if self.send_dashboard_frame(debug=True):
                     self.last_debug_keepalive = now
         else:
             self.last_debug_keepalive = time.monotonic()
@@ -1155,12 +1406,44 @@ class PDUDashboard:
             local_active_adc_reference = active_adc_reference
             local_adc_reference_applied = adc_reference_applied
             local_active_error_details = dict(active_error_details)
+            local_pmbus_debug_lines = list(pmbus_debug_lines)
             local_sum_current_da = sum_current_da
             local_vin_avg_mv = vin_avg_mv
             local_temp_avg_c = temp_avg_c
             local_temp_peak_c = temp_peak_c
             local_err_flags = err_flags
             local_debug_active = debug_active
+            local_control_state_flags = control_state_flags
+            local_requested_output_mask = requested_output_mask
+            local_applied_output_mask = applied_output_mask
+            local_maxxecu_output_mask = maxxecu_output_mask
+            local_dashboard_output_mask = dashboard_output_mask
+            local_ecu_raw_flags = ecu_raw_flags
+            local_ecu_raw_decoded_mask = ecu_raw_decoded_mask
+            local_ecu_raw_requested_mask = ecu_raw_requested_mask
+            local_ecu_raw_byte0 = ecu_raw_byte0
+            local_ecu_raw_byte1 = ecu_raw_byte1
+            local_ecu_raw_dlc = ecu_raw_dlc
+            local_ecu_raw_rx_count = ecu_raw_rx_count
+
+        self.latest_control_state_flags = local_control_state_flags
+        self.latest_requested_output_mask = local_requested_output_mask
+        self.latest_applied_output_mask = local_applied_output_mask
+        self.latest_maxxecu_output_mask = local_maxxecu_output_mask
+        self.latest_dashboard_output_mask = local_dashboard_output_mask
+        self.latest_ecu_raw_flags = local_ecu_raw_flags
+        self.latest_ecu_raw_decoded_mask = local_ecu_raw_decoded_mask
+        self.latest_ecu_raw_requested_mask = local_ecu_raw_requested_mask
+        self.latest_ecu_raw_byte0 = local_ecu_raw_byte0
+        self.latest_ecu_raw_byte1 = local_ecu_raw_byte1
+        self.latest_ecu_raw_dlc = local_ecu_raw_dlc
+        self.latest_ecu_raw_rx_count = local_ecu_raw_rx_count
+
+        if self.manual_override_var.get():
+            now = time.monotonic()
+            if now - self.last_override_keepalive >= 0.1:
+                if self.send_dashboard_frame(mask=self.manual_override_mask, armed=True, start_enabled=self.manual_override_start_enabled):
+                    self.last_override_keepalive = now
 
         # Update efuse panels
         for i in range(EFUSE_COUNT):
@@ -1169,13 +1452,21 @@ class PDUDashboard:
             v_lbl.config(text=f"V: {local_voltage[i]} mV")
             i_lbl.config(text=f"I: {local_current[i]} mA")
             p_lbl.config(text=f"P: {local_power[i]} (10mW)")
-            adc_lbl.config(text=f"ADC I: {local_adc_current[i]} mA @ {local_adc_voltage[i]} mV")
-            if local_temperature_c[i] is None:
+            if local_debug_active:
+                adc_lbl.config(text=f"ADC I: {local_adc_current[i]} mA @ {local_adc_voltage[i]} mV")
+            else:
+                adc_lbl.config(text="ADC I: debug only")
+
+            if not local_debug_active:
+                temp_lbl.config(text="T: debug only")
+            elif local_temperature_c[i] is None:
                 temp_lbl.config(text="T: --.- C")
             else:
                 temp_lbl.config(text=f"T: {local_temperature_c[i]:.1f} C")
 
-            if local_adc_flags[i] & 0x04:
+            if not local_debug_active:
+                cmp_lbl.config(text="ADC diff: debug only", bg="light gray")
+            elif local_adc_flags[i] & 0x04:
                 cmp_lbl.config(text=f"ADC diff: {local_adc_diff[i]} mA", bg="red")
             elif local_adc_flags[i] & 0x02:
                 cmp_lbl.config(text=f"ADC diff: {local_adc_diff[i]} mA", bg="green")
@@ -1183,19 +1474,70 @@ class PDUDashboard:
                 cmp_lbl.config(text="ADC diff: n/a", bg="light gray")
 
             for cml_index, (bit_pos, _) in enumerate(TPS_STATUS_CML_BITS):
-                bit_active = ((local_cml_status[i] >> bit_pos) & 1) != 0
-                cml_lbls[cml_index].config(bg="red" if bit_active else "green")
+                if not local_debug_active:
+                    cml_lbls[cml_index].config(bg="light gray")
+                else:
+                    bit_active = ((local_cml_status[i] >> bit_pos) & 1) != 0
+                    cml_lbls[cml_index].config(bg="red" if bit_active else "green")
 
             for b in range(16):
                 bit = (local_status_word[i] >> (15-b)) & 1
                 bit_lbls[b].config(bg="red" if bit else "green")
 
         # MCU
+        self.main_shunt_label.config(text=f"Shunt: {local_mcu_shunt} mA")
+        self.main_vin_label.config(text=f"VIN avg: {local_vin_avg_mv} mV")
+        self.main_sum_current_label.config(text=f"Sum I: {local_sum_current_da/10.0:.1f} A")
+        self.main_temp_label.config(text=f"Temp avg: {local_temp_avg_c:.1f} C  peak: {local_temp_peak_c:.1f} C")
+
         self.shunt_label.config(text=f"Shunt: {local_mcu_shunt} mA")
         self.vin_label.config(text=f"VIN avg: {local_vin_avg_mv} mV")
         self.sum_current_label.config(text=f"Sum I: {local_sum_current_da/10.0:.1f} A")
         self.temp_avg_label.config(text=f"Temp avg: {local_temp_avg_c:.1f} C  peak: {local_temp_peak_c:.1f} C")
         self.err_flags_label.config(text=f"Err flags: 0x{local_err_flags:02X}  Debug: {local_debug_active}")
+
+        pending_output_mask = local_requested_output_mask ^ local_applied_output_mask
+        if local_control_state_flags & CONTROL_STATE_FLAG_OVERRIDE_ACTIVE:
+            owner_text = "Manual override"
+        elif local_control_state_flags & CONTROL_STATE_FLAG_ECU_FRESH:
+            owner_text = "MaxxECU"
+        else:
+            owner_text = "No fresh command"
+
+        detail_parts = []
+        if local_control_state_flags & CONTROL_STATE_FLAG_OVERRIDE_ARMED:
+            detail_parts.append("armed")
+        if local_control_state_flags & CONTROL_STATE_FLAG_SAFETY_BLOCKED:
+            detail_parts.append("safety blocked")
+        if local_control_state_flags & CONTROL_STATE_FLAG_HYBRID_LATCHED:
+            detail_parts.append("hybrid latched")
+
+        if detail_parts:
+            owner_text = f"{owner_text} ({', '.join(detail_parts)})"
+
+        self.output_source_label.config(text=f"Source: {owner_text}")
+        self.output_mask_label.config(
+            text=(
+                f"Req 0x{local_requested_output_mask:02X}  "
+                f"App 0x{local_applied_output_mask:02X}  "
+                f"Pending 0x{pending_output_mask:02X}  "
+                f"ECU 0x{local_maxxecu_output_mask:02X}  "
+                f"Dash 0x{local_dashboard_output_mask:02X}"
+            )
+        )
+
+        raw_seen = 1 if (local_ecu_raw_flags & ECU_RAW_FLAG_SEEN) else 0
+        raw_fresh = 1 if (local_ecu_raw_flags & ECU_RAW_FLAG_FRESH) else 0
+        raw_byte1 = 1 if (local_ecu_raw_flags & ECU_RAW_FLAG_BYTE1) else 0
+        raw_dlc_ok = 1 if (local_ecu_raw_flags & ECU_RAW_FLAG_DLC_OK) else 0
+        self.raw_ecu_status_label.config(
+            text=(
+                f"0x080 dbg: seen={raw_seen} fresh={raw_fresh} byte1={raw_byte1} dlc_ok={raw_dlc_ok} "
+                f"dlc={local_ecu_raw_dlc} raw=0x{local_ecu_raw_byte0:02X}/0x{local_ecu_raw_byte1:02X} "
+                f"dec=0x{local_ecu_raw_decoded_mask:02X} req=0x{local_ecu_raw_requested_mask:02X} "
+                f"count={local_ecu_raw_rx_count}"
+            )
+        )
 
         fail_ch_text = "-" if local_mcu_dbg_fail_channel == 0xFF else str(local_mcu_dbg_fail_channel)
         err_name = MCU_ERR_NAMES.get(local_mcu_dbg_error, f"UNK_{local_mcu_dbg_error}")
@@ -1206,6 +1548,14 @@ class PDUDashboard:
         )
         self.mcu_debug_detail_label.config(
             text=f"Error:{err_name}  Command:{cmd_name}"
+        )
+        self.ecu_raw_debug_label.config(
+            text=(
+                f"0x080 raw: seen={raw_seen} fresh={raw_fresh} byte1={raw_byte1} dlc_ok={raw_dlc_ok} "
+                f"raw=0x{local_ecu_raw_byte0:02X}/0x{local_ecu_raw_byte1:02X} "
+                f"dec=0x{local_ecu_raw_decoded_mask:02X} req=0x{local_ecu_raw_requested_mask:02X} "
+                f"count={local_ecu_raw_rx_count}"
+            )
         )
 
         self.error_listbox.delete(0, tk.END)
@@ -1227,6 +1577,8 @@ class PDUDashboard:
                 )
         else:
             self.error_listbox.insert(tk.END, "No active errors")
+
+        self.refresh_pmbus_trace_panel(local_pmbus_debug_lines)
 
         for i in range(len(self.flt_labels)):
             active = (local_flt_bits >> i) & 1
