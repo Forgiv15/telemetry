@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QPlainTextEdit,
     QTabWidget,
@@ -45,6 +46,9 @@ CAN_ID_ADC_LAST = CAN_ID_ADC_BASE + 7
 CAN_ID_TEMP_BASE = 0x730
 CAN_ID_TEMP_LAST = CAN_ID_TEMP_BASE + 7
 CAN_ID_MCU = 0x740
+
+CAN_BUS_BITRATE_BPS = 500_000
+CAN_UTIL_WINDOW_S = 1.0
 
 CONTROL_MAGIC = 0xA5
 CONTROL_OP_NOP = 0x00
@@ -91,6 +95,7 @@ TPS_STATUS_CML_BITS = [
 ]
 
 HISTORY_LEN = 240
+CAN_COMPARE_TIMEOUT_S = 0.35
 
 
 @dataclass(frozen=True)
@@ -311,8 +316,16 @@ class TelemetryWindow(QMainWindow):
         self.rx_frames_can1 = 0
         self.rx_frames_can2 = 0
         self.rx_frames_total = 0
+        self.can_compare_pending_can1: dict[tuple[int, int, tuple[int, ...]], deque[float]] = {}
+        self.can_compare_pending_can2: dict[tuple[int, int, tuple[int, ...]], deque[float]] = {}
+        self.can_compare_match_count = 0
+        self.can_compare_miss_count = 0
         self.last_fps_reset = time.monotonic()
         self.fps_counter = 0
+        self.can_bits_window_can1: deque[tuple[float, int]] = deque()
+        self.can_bits_window_can2: deque[tuple[float, int]] = deque()
+        self.can_utilization_can1 = 0.0
+        self.can_utilization_can2 = 0.0
 
         self.pdu_control_state_flags = 0
         self.pdu_requested_mask = 0
@@ -459,6 +472,41 @@ class TelemetryWindow(QMainWindow):
         self.overview_stats_label = QLabel("CAN1: 0  CAN2: 0  FPS: 0")
         self.overview_stats_label.setStyleSheet("font-weight: 600;")
         layout.addWidget(self.overview_stats_label)
+
+        util_row = QHBoxLayout()
+        util_row.addWidget(QLabel("CAN1 utilization:"))
+        self.can1_util_bar = QProgressBar()
+        self.can1_util_bar.setRange(0, 100)
+        self.can1_util_bar.setFormat("%p%")
+        util_row.addWidget(self.can1_util_bar)
+        self.can1_util_label = QLabel("0.0%")
+        util_row.addWidget(self.can1_util_label)
+
+        util_row.addSpacing(12)
+        util_row.addWidget(QLabel("CAN2 utilization:"))
+        self.can2_util_bar = QProgressBar()
+        self.can2_util_bar.setRange(0, 100)
+        self.can2_util_bar.setFormat("%p%")
+        util_row.addWidget(self.can2_util_bar)
+        self.can2_util_label = QLabel("0.0%")
+        util_row.addWidget(self.can2_util_label)
+        util_row.addStretch()
+        layout.addLayout(util_row)
+
+        compare_row = QHBoxLayout()
+        self.can_compare_label = QLabel("CAN1/CAN2 compare: waiting")
+        self.can_compare_label.setStyleSheet("font-weight: 700; color:#666;")
+        compare_row.addWidget(self.can_compare_label)
+
+        self.can_compare_counts_label = QLabel("matched: 0   missed: 0   pending: 0")
+        self.can_compare_counts_label.setStyleSheet("color:#555;")
+        compare_row.addWidget(self.can_compare_counts_label)
+
+        reset_compare_btn = QPushButton("Reset CAN Compare")
+        reset_compare_btn.clicked.connect(self._reset_can_compare)
+        compare_row.addWidget(reset_compare_btn)
+        compare_row.addStretch()
+        layout.addLayout(compare_row)
 
         self.overview_imu_label = QLabel("IMU: waiting for data")
         self.overview_imu_label.setStyleSheet("font-weight: 600;")
@@ -760,10 +808,76 @@ class TelemetryWindow(QMainWindow):
             return
         self._send_serial_line(f"ASMREG {text}")
 
-    def _send_can_frame(self, can_id: int, data: list[int], bus: str = "B", extended: bool = False):
+    def _send_can_frame(self, can_id: int, data: list[int], bus: str = "1", extended: bool = False):
         payload = " ".join(f"{b & 0xFF:02X}" for b in data)
         frame_type = "E" if extended else "S"
         self._send_serial_line(f"TX,{bus},{frame_type},{can_id:X},{len(data)},{payload}")
+
+    def _reset_can_compare(self):
+        self.can_compare_pending_can1.clear()
+        self.can_compare_pending_can2.clear()
+        self.can_compare_match_count = 0
+        self.can_compare_miss_count = 0
+
+    def _prune_can_compare(self, now: float):
+        for pending_map in (self.can_compare_pending_can1, self.can_compare_pending_can2):
+            empty_keys = []
+            for signature, timestamps in pending_map.items():
+                while timestamps and (now - timestamps[0]) > CAN_COMPARE_TIMEOUT_S:
+                    timestamps.popleft()
+                    self.can_compare_miss_count += 1
+                if not timestamps:
+                    empty_keys.append(signature)
+            for signature in empty_keys:
+                pending_map.pop(signature, None)
+
+    def _track_can_compare(self, bus_name: str, can_id: int, dlc: int, payload: list[int]):
+        now = time.monotonic()
+        self._prune_can_compare(now)
+
+        signature = (can_id, dlc, tuple(payload[:dlc]))
+        if bus_name == "CAN1":
+            own_map = self.can_compare_pending_can1
+            other_map = self.can_compare_pending_can2
+        elif bus_name == "CAN2":
+            own_map = self.can_compare_pending_can2
+            other_map = self.can_compare_pending_can1
+        else:
+            return
+
+        other_timestamps = other_map.get(signature)
+        if other_timestamps:
+            other_timestamps.popleft()
+            if not other_timestamps:
+                other_map.pop(signature, None)
+            self.can_compare_match_count += 1
+            return
+
+        own_map.setdefault(signature, deque()).append(now)
+
+    def _estimate_can_frame_bits(self, extended: bool, dlc: int) -> int:
+        payload_bits = max(0, min(8, dlc)) * 8
+        base_bits = (67 if extended else 47) + payload_bits
+        return int(base_bits * 1.2)
+
+    def _prune_util_window(self, now: float):
+        for window in (self.can_bits_window_can1, self.can_bits_window_can2):
+            while window and (now - window[0][0]) > CAN_UTIL_WINDOW_S:
+                window.popleft()
+
+    def _update_can_utilization(self, bus_name: str, extended: bool, dlc: int):
+        now = time.monotonic()
+        frame_bits = self._estimate_can_frame_bits(extended, dlc)
+        if bus_name == "CAN1":
+            self.can_bits_window_can1.append((now, frame_bits))
+        elif bus_name == "CAN2":
+            self.can_bits_window_can2.append((now, frame_bits))
+
+        self._prune_util_window(now)
+        bits_can1 = sum(bits for _, bits in self.can_bits_window_can1)
+        bits_can2 = sum(bits for _, bits in self.can_bits_window_can2)
+        self.can_utilization_can1 = min(100.0, (bits_can1 / CAN_BUS_BITRATE_BPS) * 100.0)
+        self.can_utilization_can2 = min(100.0, (bits_can2 / CAN_BUS_BITRATE_BPS) * 100.0)
 
     def _build_pdu_mask(self) -> int:
         mask = 0
@@ -804,7 +918,7 @@ class TelemetryWindow(QMainWindow):
             flags |= CONTROL_FLAG_DEBUG
 
         payload = [mask & 0xFF, flags & 0xFF, opcode & 0xFF, param0 & 0xFF, param1 & 0xFF, CONTROL_MAGIC]
-        self._send_can_frame(CAN_ID_CONTROL, payload, bus="B", extended=False)
+        self._send_can_frame(CAN_ID_CONTROL, payload, bus="1", extended=False)
 
     def _send_pdu_keepalive(self):
         if self.override_check.isChecked() or self.debug_check.isChecked():
@@ -846,6 +960,7 @@ class TelemetryWindow(QMainWindow):
         bus_name = parts[0].strip()
         try:
             timestamp_ms = int(parts[1].strip())
+            extended = parts[2].strip().upper() == "E"
             can_id = int(parts[3].strip(), 16)
             dlc = int(parts[4].strip())
         except ValueError:
@@ -861,6 +976,9 @@ class TelemetryWindow(QMainWindow):
             self.rx_frames_can1 += 1
         elif bus_name == "CAN2":
             self.rx_frames_can2 += 1
+
+        self._update_can_utilization(bus_name, extended, dlc)
+        self._track_can_compare(bus_name, can_id, dlc, payload)
 
         self._decode_maxxecu(can_id, payload, timestamp_ms)
         self._decode_pdu_feedback(can_id, payload)
@@ -992,9 +1110,40 @@ class TelemetryWindow(QMainWindow):
             self.last_fps_reset = now
             self.fps_counter = 0
 
+        self._prune_util_window(now)
+        bits_can1 = sum(bits for _, bits in self.can_bits_window_can1)
+        bits_can2 = sum(bits for _, bits in self.can_bits_window_can2)
+        self.can_utilization_can1 = min(100.0, (bits_can1 / CAN_BUS_BITRATE_BPS) * 100.0)
+        self.can_utilization_can2 = min(100.0, (bits_can2 / CAN_BUS_BITRATE_BPS) * 100.0)
+
+        self._prune_can_compare(now)
+        pending_total = sum(len(items) for items in self.can_compare_pending_can1.values()) + sum(
+            len(items) for items in self.can_compare_pending_can2.values()
+        )
+
         self.overview_stats_label.setText(
             f"CAN1 RX: {self.rx_frames_can1}   CAN2 RX: {self.rx_frames_can2}   Total: {self.rx_frames_total}   Serial FPS: {fps}"
         )
+        self.can1_util_bar.setValue(int(self.can_utilization_can1))
+        self.can2_util_bar.setValue(int(self.can_utilization_can2))
+        self.can1_util_label.setText(f"{self.can_utilization_can1:.1f}%")
+        self.can2_util_label.setText(f"{self.can_utilization_can2:.1f}%")
+        self.can_compare_counts_label.setText(
+            f"matched: {self.can_compare_match_count}   missed: {self.can_compare_miss_count}   pending: {pending_total}"
+        )
+
+        if self.can_compare_match_count == 0 and self.can_compare_miss_count == 0 and pending_total == 0:
+            self.can_compare_label.setText("CAN1/CAN2 compare: waiting")
+            self.can_compare_label.setStyleSheet("font-weight: 700; color:#666;")
+        elif self.can_compare_miss_count == 0 and pending_total == 0:
+            self.can_compare_label.setText("CAN1/CAN2 compare: MATCH")
+            self.can_compare_label.setStyleSheet("font-weight: 700; color:#0a7f2e;")
+        elif self.can_compare_miss_count == 0:
+            self.can_compare_label.setText("CAN1/CAN2 compare: pending")
+            self.can_compare_label.setStyleSheet("font-weight: 700; color:#9a6a00;")
+        else:
+            self.can_compare_label.setText("CAN1/CAN2 compare: MISMATCH")
+            self.can_compare_label.setStyleSheet("font-weight: 700; color:#b00020;")
 
         self.overview_imu_label.setText(self.last_imu_text)
         self.asm_imu_label.setText(self.last_imu_text)

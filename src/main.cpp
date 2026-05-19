@@ -6,8 +6,11 @@
 #include <Wire.h>
 #include <ASM330LHHSensor.h>
 #include <driver/twai.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <math.h>
-#include <mcp2515.h>
 
 namespace {
 
@@ -35,12 +38,21 @@ constexpr int kAsm330DrdyPin = 45;
 constexpr int kAsm330CsPin = 35;  // bodge wire: was GND, now IO35
 constexpr bool kAsm330Sa0High = true;
 constexpr uint32_t kAsm330I2cHz = 400000;
+constexpr bool kEnableAsm330Runtime = false;
 
 constexpr int kSdCsPin = 9;
 constexpr int kMcp2515CsPin = 10;
 constexpr int kMcp2515MosiPin = 11;
 constexpr int kMcp2515SckPin = 12;
 constexpr int kMcp2515MisoPin = 13;
+constexpr uint32_t kMcp2515SpiHz = 4000000;
+constexpr uint32_t kMcp2515StatusPeriodMs = 1000;
+constexpr bool kMcp2515EnableClockRecovery = false;
+constexpr uint32_t kMcpServiceTaskStack = 4096;
+constexpr UBaseType_t kMcpServiceTaskPriority = 3;
+constexpr BaseType_t kMcpServiceTaskCore = 0;
+constexpr size_t kMcpRxQueueDepth = 256;
+constexpr uint32_t kMcpErrorReportPeriodMs = 250;
 
 constexpr uint32_t kRecordButtonDebounceMs = 35;
 
@@ -82,12 +94,450 @@ constexpr uint8_t kAsm330StatusAccelGyroReady = kAsm330StatusAccelReady | kAsm33
 constexpr float kAccelScaleGPerLsb = 0.000488f;
 constexpr float kGyroScaleDpsPerLsb = 0.07f;
 
+using canid_t = uint32_t;
+
+constexpr canid_t CAN_EFF_FLAG = 0x80000000UL;
+constexpr canid_t CAN_RTR_FLAG = 0x40000000UL;
+constexpr canid_t CAN_SFF_MASK = 0x000007FFUL;
+constexpr canid_t CAN_EFF_MASK = 0x1FFFFFFFUL;
+constexpr uint8_t CAN_MAX_DLEN = 8;
+
+struct can_frame {
+  canid_t can_id = 0;
+  uint8_t can_dlc = 0;
+  alignas(8) uint8_t data[CAN_MAX_DLEN] = {};
+};
+
+struct QueuedCanFrame {
+  can_frame frame = {};
+  uint32_t timestampMs = 0;
+};
+
+struct Mcp2515BitTimingProfile {
+  uint8_t cnf1;
+  uint8_t cnf2;
+  uint8_t cnf3;
+  const char *label;
+};
+
+struct Mcp2515TxBufferConfig {
+  uint8_t ctrl;
+  uint8_t sidh;
+  uint8_t rtsInstruction;
+};
+
+struct Mcp2515RxBufferConfig {
+  uint8_t ctrl;
+  uint8_t sidh;
+  uint8_t data;
+  uint8_t interruptFlag;
+};
+
+bool takeCanSpiMutex();
+void giveCanSpiMutex();
+
+constexpr uint8_t kMcp2515OpcodeWrite = 0x02;
+constexpr uint8_t kMcp2515OpcodeRead = 0x03;
+constexpr uint8_t kMcp2515OpcodeBitModify = 0x05;
+constexpr uint8_t kMcp2515OpcodeReadStatus = 0xA0;
+constexpr uint8_t kMcp2515OpcodeReset = 0xC0;
+
+constexpr uint8_t kMcp2515RegCanstat = 0x0E;
+constexpr uint8_t kMcp2515RegCanctrl = 0x0F;
+constexpr uint8_t kMcp2515RegTec = 0x1C;
+constexpr uint8_t kMcp2515RegRec = 0x1D;
+constexpr uint8_t kMcp2515RegCnf3 = 0x28;
+constexpr uint8_t kMcp2515RegCnf2 = 0x29;
+constexpr uint8_t kMcp2515RegCnf1 = 0x2A;
+constexpr uint8_t kMcp2515RegCaninte = 0x2B;
+constexpr uint8_t kMcp2515RegCanintf = 0x2C;
+constexpr uint8_t kMcp2515RegEflg = 0x2D;
+
+constexpr uint8_t kMcp2515CanctrlReqOpMask = 0xE0;
+constexpr uint8_t kMcp2515CanctrlOneShot = 0x08;
+constexpr uint8_t kMcp2515CanctrlClken = 0x04;
+constexpr uint8_t kMcp2515CanctrlClkPreMask = 0x03;
+
+constexpr uint8_t kMcp2515ModeNormal = 0x00;
+constexpr uint8_t kMcp2515ModeSleep = 0x20;
+constexpr uint8_t kMcp2515ModeLoopback = 0x40;
+constexpr uint8_t kMcp2515ModeListenOnly = 0x60;
+constexpr uint8_t kMcp2515ModeConfig = 0x80;
+
+constexpr uint8_t kMcp2515Cnf3Sof = 0x80;
+
+constexpr uint8_t kMcp2515InterruptRx0 = 0x01;
+constexpr uint8_t kMcp2515InterruptRx1 = 0x02;
+constexpr uint8_t kMcp2515InterruptTx0 = 0x04;
+constexpr uint8_t kMcp2515InterruptTx1 = 0x08;
+constexpr uint8_t kMcp2515InterruptTx2 = 0x10;
+constexpr uint8_t kMcp2515InterruptErr = 0x20;
+constexpr uint8_t kMcp2515InterruptMerr = 0x80;
+constexpr uint8_t kMcp2515InterruptTxMask =
+    kMcp2515InterruptTx0 | kMcp2515InterruptTx1 | kMcp2515InterruptTx2;
+
+constexpr uint8_t kMcp2515EflgRx1Ovr = 0x80;
+constexpr uint8_t kMcp2515EflgRx0Ovr = 0x40;
+
+constexpr uint8_t kMcp2515ReadStatusRx0If = 0x01;
+constexpr uint8_t kMcp2515ReadStatusRx1If = 0x02;
+
+constexpr uint8_t kMcp2515TxbExideMask = 0x08;
+constexpr uint8_t kMcp2515DlcMask = 0x0F;
+constexpr uint8_t kMcp2515RtrMask = 0x40;
+
+constexpr uint8_t kMcp2515RxModeMask = 0x60;
+constexpr uint8_t kMcp2515RxModeAny = 0x60;
+constexpr uint8_t kMcp2515RxModeStdExt = 0x00;
+constexpr uint8_t kMcp2515RxB0Bukt = 0x04;
+constexpr uint8_t kMcp2515RxBnCtrlRtr = 0x08;
+
+constexpr uint8_t kMcp2515TxCtrlAbtf = 0x40;
+constexpr uint8_t kMcp2515TxCtrlMloa = 0x20;
+constexpr uint8_t kMcp2515TxCtrlTxErr = 0x10;
+constexpr uint8_t kMcp2515TxCtrlTxReq = 0x08;
+
+constexpr uint8_t kMcp2515IdSidH = 0;
+constexpr uint8_t kMcp2515IdSidL = 1;
+constexpr uint8_t kMcp2515IdEid8 = 2;
+constexpr uint8_t kMcp2515IdEid0 = 3;
+constexpr uint8_t kMcp2515IdDlc = 4;
+constexpr uint8_t kMcp2515IdData = 5;
+
+constexpr Mcp2515TxBufferConfig kMcp2515TxBuffers[] = {
+    {0x30, 0x31, 0x81},
+    {0x40, 0x41, 0x82},
+    {0x50, 0x51, 0x84},
+};
+
+constexpr Mcp2515RxBufferConfig kMcp2515RxBuffers[] = {
+    {0x60, 0x61, 0x66, kMcp2515InterruptRx0},
+    {0x70, 0x71, 0x76, kMcp2515InterruptRx1},
+};
+
+constexpr uint8_t kMcp2515RxFilterRegisters[] = {0x00, 0x04, 0x08, 0x10, 0x14, 0x18};
+constexpr uint8_t kMcp2515RxMaskRegisters[] = {0x20, 0x24};
+
+constexpr Mcp2515BitTimingProfile kMcp2515ClockCandidates[] = {
+    {0x00, 0xA0, 0x02, "10MHZ"},
+    {0x00, 0x90, 0x82, "8MHZ"},
+    {0x00, 0xF0, 0x86, "16MHZ"},
+    {0x00, 0xFA, 0x87, "20MHZ"},
+};
+constexpr size_t kMcp2515DefaultClockCandidateIndex = 0;
+
+class Mcp2515Driver {
+ public:
+  enum class Error : uint8_t {
+    Ok = 0,
+    Fail = 1,
+    AllTxBusy = 2,
+    NoMessage = 3,
+  };
+
+  Mcp2515Driver(const uint8_t csPin, const uint32_t spiHz, SPIClass *spi)
+      : csPin_(csPin), spiHz_(spiHz), spi_(spi) {}
+
+  void begin(const int sckPin, const int misoPin, const int mosiPin) {
+    pinMode(csPin_, OUTPUT);
+    digitalWrite(csPin_, HIGH);
+    spi_->begin(sckPin, misoPin, mosiPin, csPin_);
+  }
+
+  Error initialize(const Mcp2515BitTimingProfile &timing) {
+    if (!reset()) {
+      return Error::Fail;
+    }
+    if (!requestMode(kMcp2515ModeConfig)) {
+      return Error::Fail;
+    }
+
+    writeRegister(kMcp2515RegCnf1, timing.cnf1);
+    writeRegister(kMcp2515RegCnf2, timing.cnf2);
+    writeRegister(kMcp2515RegCnf3, timing.cnf3);
+
+    bitModify(kMcp2515RegCanctrl, kMcp2515CanctrlClkPreMask, 0x00);
+    bitModify(kMcp2515RegCanctrl, kMcp2515CanctrlClken, 0x00);
+    bitModify(kMcp2515RegCnf3, kMcp2515Cnf3Sof, kMcp2515Cnf3Sof);
+
+    const uint8_t zeroBlock[14] = {};
+    for (const Mcp2515TxBufferConfig &txBuffer : kMcp2515TxBuffers) {
+      writeRegisters(txBuffer.ctrl, zeroBlock, sizeof(zeroBlock));
+    }
+
+    writeRegister(kMcp2515RxBuffers[0].ctrl, kMcp2515RxModeAny | kMcp2515RxB0Bukt);
+    writeRegister(kMcp2515RxBuffers[1].ctrl, kMcp2515RxModeAny);
+
+    const uint8_t zeroId[4] = {};
+    for (const uint8_t reg : kMcp2515RxFilterRegisters) {
+      writeRegisters(reg, zeroId, sizeof(zeroId));
+    }
+    for (const uint8_t reg : kMcp2515RxMaskRegisters) {
+      writeRegisters(reg, zeroId, sizeof(zeroId));
+    }
+
+    writeRegister(kMcp2515RegCaninte,
+                  kMcp2515InterruptRx0 | kMcp2515InterruptRx1 | kMcp2515InterruptErr | kMcp2515InterruptMerr);
+    writeRegister(kMcp2515RegCanintf, 0x00);
+    bitModify(kMcp2515RegEflg, kMcp2515EflgRx0Ovr | kMcp2515EflgRx1Ovr, 0x00);
+
+    return requestMode(kMcp2515ModeNormal) ? Error::Ok : Error::Fail;
+  }
+
+  Error readMessage(can_frame *frame) {
+    const uint8_t intf = readRegister(kMcp2515RegCanintf);
+    if ((intf & kMcp2515InterruptRx0) != 0U) {
+      return readMessageFromBuffer(0, frame);
+    }
+    if ((intf & kMcp2515InterruptRx1) != 0U) {
+      return readMessageFromBuffer(1, frame);
+    }
+
+    const uint8_t status = readStatus();
+    if ((status & kMcp2515ReadStatusRx0If) != 0U) {
+      return readMessageFromBuffer(0, frame);
+    }
+    if ((status & kMcp2515ReadStatusRx1If) != 0U) {
+      return readMessageFromBuffer(1, frame);
+    }
+    return Error::NoMessage;
+  }
+
+  Error sendMessage(const can_frame *frame) {
+    if (frame == nullptr || frame->can_dlc > CAN_MAX_DLEN) {
+      return Error::Fail;
+    }
+
+    for (size_t index = 0; index < (sizeof(kMcp2515TxBuffers) / sizeof(kMcp2515TxBuffers[0])); ++index) {
+      if ((readRegister(kMcp2515TxBuffers[index].ctrl) & kMcp2515TxCtrlTxReq) == 0U) {
+        return sendMessage(index, *frame);
+      }
+    }
+
+    return Error::AllTxBusy;
+  }
+
+  uint8_t getErrorFlags() {
+    return readRegister(kMcp2515RegEflg);
+  }
+
+  uint8_t getInterruptFlags() {
+    return readRegister(kMcp2515RegCanintf);
+  }
+
+  uint8_t getReceiveErrorCount() {
+    return readRegister(kMcp2515RegRec);
+  }
+
+  uint8_t getTransmitErrorCount() {
+    return readRegister(kMcp2515RegTec);
+  }
+
+  uint8_t getOperatingMode() {
+    return readRegister(kMcp2515RegCanstat) & kMcp2515CanctrlReqOpMask;
+  }
+
+  void clearRxOverflow() {
+    bitModify(kMcp2515RegEflg, kMcp2515EflgRx0Ovr | kMcp2515EflgRx1Ovr, 0x00);
+  }
+
+  void clearErrorInterrupts() {
+    bitModify(kMcp2515RegCanintf, kMcp2515InterruptErr | kMcp2515InterruptMerr, 0x00);
+  }
+
+  bool setMode(const uint8_t mode) {
+    return requestMode(mode);
+  }
+
+ private:
+  void beginTransfer() {
+    takeCanSpiMutex();
+    // Keep SD deselected while talking to MCP2515 on the shared HSPI bus.
+    digitalWrite(kSdCsPin, HIGH);
+    spi_->beginTransaction(SPISettings(spiHz_, MSBFIRST, SPI_MODE0));
+    digitalWrite(csPin_, LOW);
+  }
+
+  void endTransfer() {
+    digitalWrite(csPin_, HIGH);
+    spi_->endTransaction();
+    giveCanSpiMutex();
+  }
+
+  bool reset() {
+    beginTransfer();
+    spi_->transfer(kMcp2515OpcodeReset);
+    endTransfer();
+    delay(10);
+    return true;
+  }
+
+  bool requestMode(const uint8_t mode) {
+    bitModify(kMcp2515RegCanctrl, kMcp2515CanctrlReqOpMask | kMcp2515CanctrlOneShot, mode);
+
+    const uint32_t deadline = millis() + 10U;
+    while (millis() < deadline) {
+      if ((readRegister(kMcp2515RegCanstat) & kMcp2515CanctrlReqOpMask) == mode) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  uint8_t readRegister(const uint8_t reg) {
+    beginTransfer();
+    spi_->transfer(kMcp2515OpcodeRead);
+    spi_->transfer(reg);
+    const uint8_t value = spi_->transfer(0x00);
+    endTransfer();
+    return value;
+  }
+
+  void readRegisters(const uint8_t reg, uint8_t *values, const uint8_t length) {
+    beginTransfer();
+    spi_->transfer(kMcp2515OpcodeRead);
+    spi_->transfer(reg);
+    for (uint8_t index = 0; index < length; ++index) {
+      values[index] = spi_->transfer(0x00);
+    }
+    endTransfer();
+  }
+
+  void writeRegister(const uint8_t reg, const uint8_t value) {
+    beginTransfer();
+    spi_->transfer(kMcp2515OpcodeWrite);
+    spi_->transfer(reg);
+    spi_->transfer(value);
+    endTransfer();
+  }
+
+  void writeRegisters(const uint8_t reg, const uint8_t *values, const uint8_t length) {
+    beginTransfer();
+    spi_->transfer(kMcp2515OpcodeWrite);
+    spi_->transfer(reg);
+    for (uint8_t index = 0; index < length; ++index) {
+      spi_->transfer(values[index]);
+    }
+    endTransfer();
+  }
+
+  void bitModify(const uint8_t reg, const uint8_t mask, const uint8_t value) {
+    beginTransfer();
+    spi_->transfer(kMcp2515OpcodeBitModify);
+    spi_->transfer(reg);
+    spi_->transfer(mask);
+    spi_->transfer(value);
+    endTransfer();
+  }
+
+  uint8_t readStatus() {
+    beginTransfer();
+    spi_->transfer(kMcp2515OpcodeReadStatus);
+    const uint8_t status = spi_->transfer(0x00);
+    endTransfer();
+    return status;
+  }
+
+  void prepareId(uint8_t *buffer, const bool extended, const uint32_t identifier) {
+    uint16_t canId = static_cast<uint16_t>(identifier & 0xFFFFU);
+    if (extended) {
+      buffer[kMcp2515IdEid0] = static_cast<uint8_t>(canId & 0xFFU);
+      buffer[kMcp2515IdEid8] = static_cast<uint8_t>(canId >> 8);
+      canId = static_cast<uint16_t>(identifier >> 16);
+      buffer[kMcp2515IdSidL] = static_cast<uint8_t>(canId & 0x03U);
+      buffer[kMcp2515IdSidL] |= static_cast<uint8_t>((canId & 0x1CU) << 3);
+      buffer[kMcp2515IdSidL] |= kMcp2515TxbExideMask;
+      buffer[kMcp2515IdSidH] = static_cast<uint8_t>(canId >> 5);
+      return;
+    }
+
+    buffer[kMcp2515IdSidH] = static_cast<uint8_t>(canId >> 3);
+    buffer[kMcp2515IdSidL] = static_cast<uint8_t>((canId & 0x07U) << 5);
+    buffer[kMcp2515IdEid8] = 0;
+    buffer[kMcp2515IdEid0] = 0;
+  }
+
+  Error sendMessage(const size_t bufferIndex, const can_frame &frame) {
+    if (bufferIndex >= (sizeof(kMcp2515TxBuffers) / sizeof(kMcp2515TxBuffers[0]))) {
+      return Error::Fail;
+    }
+
+    const Mcp2515TxBufferConfig &txBuffer = kMcp2515TxBuffers[bufferIndex];
+    uint8_t packet[13] = {};
+    const bool extended = (frame.can_id & CAN_EFF_FLAG) != 0U;
+    const bool remote = (frame.can_id & CAN_RTR_FLAG) != 0U;
+    const uint32_t identifier = frame.can_id & (extended ? CAN_EFF_MASK : CAN_SFF_MASK);
+
+    prepareId(packet, extended, identifier);
+    packet[kMcp2515IdDlc] = static_cast<uint8_t>(frame.can_dlc & kMcp2515DlcMask);
+    if (remote) {
+      packet[kMcp2515IdDlc] |= kMcp2515RtrMask;
+    }
+    memcpy(&packet[kMcp2515IdData], frame.data, frame.can_dlc);
+
+    writeRegisters(txBuffer.sidh, packet, static_cast<uint8_t>(5U + frame.can_dlc));
+
+    beginTransfer();
+    spi_->transfer(txBuffer.rtsInstruction);
+    endTransfer();
+
+    const uint8_t ctrl = readRegister(txBuffer.ctrl);
+    return ((ctrl & (kMcp2515TxCtrlAbtf | kMcp2515TxCtrlMloa | kMcp2515TxCtrlTxErr)) == 0U)
+               ? Error::Ok
+               : Error::Fail;
+  }
+
+  Error readMessageFromBuffer(const size_t bufferIndex, can_frame *frame) {
+    if (frame == nullptr || bufferIndex >= (sizeof(kMcp2515RxBuffers) / sizeof(kMcp2515RxBuffers[0]))) {
+      return Error::Fail;
+    }
+
+    const Mcp2515RxBufferConfig &rxBuffer = kMcp2515RxBuffers[bufferIndex];
+    uint8_t header[5] = {};
+    readRegisters(rxBuffer.sidh, header, sizeof(header));
+
+    uint32_t identifier = (static_cast<uint32_t>(header[kMcp2515IdSidH]) << 3) |
+                          (static_cast<uint32_t>(header[kMcp2515IdSidL]) >> 5);
+    if ((header[kMcp2515IdSidL] & kMcp2515TxbExideMask) != 0U) {
+      identifier = (identifier << 2) | (header[kMcp2515IdSidL] & 0x03U);
+      identifier = (identifier << 8) | header[kMcp2515IdEid8];
+      identifier = (identifier << 8) | header[kMcp2515IdEid0];
+      identifier |= CAN_EFF_FLAG;
+    }
+
+    const uint8_t dlc = static_cast<uint8_t>(header[kMcp2515IdDlc] & kMcp2515DlcMask);
+    if (dlc > CAN_MAX_DLEN) {
+      return Error::Fail;
+    }
+
+    if ((readRegister(rxBuffer.ctrl) & kMcp2515RxBnCtrlRtr) != 0U) {
+      identifier |= CAN_RTR_FLAG;
+    }
+
+    frame->can_id = identifier;
+    frame->can_dlc = dlc;
+    if (dlc > 0U) {
+      readRegisters(rxBuffer.data, frame->data, dlc);
+    }
+
+    bitModify(kMcp2515RegCanintf, rxBuffer.interruptFlag, 0x00);
+    return Error::Ok;
+  }
+
+  uint8_t csPin_;
+  uint32_t spiHz_;
+  SPIClass *spi_;
+};
+
 TwoWire imuI2c(0);
 ASM330LHHSensor asm330SensorHigh(&imuI2c, kAsm330DriverAddressHigh);
 ASM330LHHSensor asm330SensorLow(&imuI2c, kAsm330DriverAddressLow);
 ASM330LHHSensor *g_asm330Sensor = &asm330SensorHigh;
 SPIClass canSpi(HSPI);
-MCP2515 mcp2515(kMcp2515CsPin, 8000000, &canSpi);
+Mcp2515Driver mcp2515(kMcp2515CsPin, kMcp2515SpiHz, &canSpi);
+SemaphoreHandle_t g_canSpiMutex = nullptr;
+TaskHandle_t g_mcpServiceTaskHandle = nullptr;
+QueueHandle_t g_mcpRxQueue = nullptr;
 
 volatile bool g_imuDataReady = false;
 bool g_twaiReady = false;
@@ -98,12 +548,15 @@ bool g_sdError = false;
 bool g_recordingRequested = false;
 bool g_buttonStablePressed = false;
 bool g_buttonLastReadPressed = false;
+const char *g_mcpClockLabel = "UNKNOWN";
 
 uint32_t g_lastHeartbeatToggleMs = 0;
 bool g_greenLedState = false;
 uint32_t g_lastRedBlinkToggleMs = 0;
 bool g_redBlinkState = false;
 uint32_t g_lastHardStopMs = 0;
+uint32_t g_lastMcpProfileSwitchMs = 0;
+uint32_t g_lastMcpStatusMs = 0;
 uint32_t g_lastImuPollUs = 0;
 uint32_t g_sampleCounter = 0;
 uint32_t g_buttonLastTransitionMs = 0;
@@ -111,6 +564,18 @@ uint16_t g_logFileIndex = 0;
 uint32_t g_lastAsm330DebugMs = 0;
 uint32_t g_lastTwaiStatusMs = 0;
 uint32_t g_twaiRxFrameCount = 0;
+volatile uint32_t g_mcpRxFrameCount = 0;
+volatile uint32_t g_mcpRxOverrunCount = 0;
+volatile uint32_t g_mcpRxReadErrorCount = 0;
+volatile uint32_t g_mcpQueueDropCount = 0;
+volatile uint8_t g_mcpLastOverrunEflg = 0;
+volatile uint8_t g_mcpLastReadErrEflg = 0;
+volatile uint8_t g_mcpLastReadErrCanintf = 0;
+uint32_t g_lastMcpErrorReportMs = 0;
+uint32_t g_reportedMcpRxOverrunCount = 0;
+uint32_t g_reportedMcpRxReadErrorCount = 0;
+uint32_t g_reportedMcpQueueDropCount = 0;
+size_t g_mcpClockCandidateIndex = 0;
 
 volatile uint32_t g_asm330IrqCount = 0;
 uint32_t g_asm330ReadAttemptCount = 0;
@@ -140,6 +605,16 @@ bool g_asm330InitRetryEnabled = false;
 bool g_asm330LastInitSucceeded = false;
 
 File g_logFile;
+
+bool takeCanSpiMutex() {
+  return g_canSpiMutex == nullptr || xSemaphoreTake(g_canSpiMutex, portMAX_DELAY) == pdTRUE;
+}
+
+void giveCanSpiMutex() {
+  if (g_canSpiMutex != nullptr) {
+    xSemaphoreGive(g_canSpiMutex);
+  }
+}
 
 struct ImuSample {
   int16_t accelRaw[3];
@@ -188,8 +663,19 @@ bool openLogFile() {
   char fileName[20] = {};
   for (uint16_t idx = g_logFileIndex; idx < 1000; ++idx) {
     snprintf(fileName, sizeof(fileName), "/LOG%03u.CSV", idx);
-    if (!SD.exists(fileName)) {
+    if (!takeCanSpiMutex()) {
+      g_sdError = true;
+      Serial.println("SD,ERR,MUTEX");
+      return false;
+    }
+
+    // Keep MCP2515 deselected while talking to SD on shared HSPI.
+    digitalWrite(kMcp2515CsPin, HIGH);
+
+    const bool exists = SD.exists(fileName);
+    if (!exists) {
       g_logFile = SD.open(fileName, FILE_WRITE);
+      giveCanSpiMutex();
       if (g_logFile) {
         g_logFileIndex = idx + 1;
         g_logFile.println("TYPE,MS,IDTYPE,ID,DLC,DATA");
@@ -202,6 +688,8 @@ bool openLogFile() {
       Serial.printf("SD,ERR,OPEN,%s\n", fileName);
       return false;
     }
+
+    giveCanSpiMutex();
   }
 
   g_sdError = true;
@@ -211,8 +699,11 @@ bool openLogFile() {
 
 void closeLogFile() {
   if (g_logFile) {
-    g_logFile.flush();
-    g_logFile.close();
+    if (takeCanSpiMutex()) {
+      g_logFile.flush();
+      g_logFile.close();
+      giveCanSpiMutex();
+    }
     Serial.println("SD,LOG_CLOSED");
   }
 }
@@ -222,7 +713,17 @@ bool logLine(const String &line) {
     return false;
   }
 
+  if (!takeCanSpiMutex()) {
+    g_sdError = true;
+    Serial.println("SD,ERR,MUTEX");
+    return false;
+  }
+
+  // Keep MCP2515 deselected while talking to SD on shared HSPI.
+  digitalWrite(kMcp2515CsPin, HIGH);
+
   if (g_logFile.println(line) == 0) {
+    giveCanSpiMutex();
     g_sdError = true;
     closeLogFile();
     Serial.println("SD,ERR,WRITE");
@@ -232,6 +733,8 @@ bool logLine(const String &line) {
   if ((g_sampleCounter % 32U) == 0U) {
     g_logFile.flush();
   }
+
+  giveCanSpiMutex();
 
   return true;
 }
@@ -538,37 +1041,127 @@ bool initTwai() {
   return true;
 }
 
+bool configureMcp2515Profile(const size_t candidateIndex, const char *prefix) {
+  if (candidateIndex >= (sizeof(kMcp2515ClockCandidates) / sizeof(kMcp2515ClockCandidates[0]))) {
+    return false;
+  }
+
+  const Mcp2515BitTimingProfile &candidate = kMcp2515ClockCandidates[candidateIndex];
+  if (mcp2515.initialize(candidate) != Mcp2515Driver::Error::Ok) {
+    return false;
+  }
+
+  g_mcpClockCandidateIndex = candidateIndex;
+  g_mcpClockLabel = candidate.label;
+  g_lastMcpProfileSwitchMs = millis();
+  Serial.printf(
+      "%s,CLOCK=%s,CNF=%02X/%02X/%02X\n",
+      prefix,
+      g_mcpClockLabel,
+      candidate.cnf1,
+      candidate.cnf2,
+      candidate.cnf3);
+  return true;
+}
+
 bool initMcp2515() {
   pinMode(kSdCsPin, OUTPUT);
   digitalWrite(kSdCsPin, HIGH);
 
-  canSpi.begin(kMcp2515SckPin, kMcp2515MisoPin, kMcp2515MosiPin, kMcp2515CsPin);
+  mcp2515.begin(kMcp2515SckPin, kMcp2515MisoPin, kMcp2515MosiPin);
 
-  if (mcp2515.reset() != MCP2515::ERROR_OK) {
-    Serial.println("BOOT,MCP2515,ERR,RESET");
+  if (!configureMcp2515Profile(kMcp2515DefaultClockCandidateIndex, "BOOT,MCP2515,CFG")) {
+    Serial.println("BOOT,MCP2515,ERR,INIT");
     return false;
   }
 
-  // autowp-mcp2515 has no MCP_10MHZ enum; this profile yields 500 kbps when Fosc=10 MHz.
-  if (mcp2515.setBitrate(CAN_1000KBPS, MCP_20MHZ) != MCP2515::ERROR_OK) {
-    Serial.println("BOOT,MCP2515,ERR,BITRATE");
-    return false;
-  }
-
-  if (mcp2515.setNormalOneShotMode() != MCP2515::ERROR_OK) {
-    Serial.println("BOOT,MCP2515,ERR,MODE");
-    return false;
-  }
-
-  Serial.println("BOOT,MCP2515,OK,500KBPS,OSC=10MHZ,ONE_SHOT");
+  Serial.printf("BOOT,MCP2515,OK,500KBPS,OSC=%s,NORMAL,RX_POLL\n", g_mcpClockLabel);
   return true;
+}
+
+void serviceMcpRecovery() {
+  if (!kMcp2515EnableClockRecovery || !g_mcpReady || g_mcpRxFrameCount > 0U || g_twaiRxFrameCount == 0U) {
+    return;
+  }
+}
+
+void serviceMcpStatus() {
+  if (!g_mcpReady) {
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  if ((nowMs - g_lastMcpStatusMs) < kMcp2515StatusPeriodMs) {
+    return;
+  }
+
+  g_lastMcpStatusMs = nowMs;
+  Serial.printf(
+      "MCP2515,STATE,MODE=0x%02X,EFLG=0x%02X,CANINTF=0x%02X,TEC=%u,REC=%u,RX_FRAMES=%lu,QUEUE_DROP=%lu,OSC=%s\n",
+      mcp2515.getOperatingMode(),
+      mcp2515.getErrorFlags(),
+      mcp2515.getInterruptFlags(),
+      mcp2515.getTransmitErrorCount(),
+      mcp2515.getReceiveErrorCount(),
+      static_cast<unsigned long>(g_mcpRxFrameCount),
+      static_cast<unsigned long>(g_mcpQueueDropCount),
+      g_mcpClockLabel);
+}
+
+void serviceMcpErrorReport() {
+  if (!g_mcpReady) {
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  if ((nowMs - g_lastMcpErrorReportMs) < kMcpErrorReportPeriodMs) {
+    return;
+  }
+  g_lastMcpErrorReportMs = nowMs;
+
+  const uint32_t overrunCount = g_mcpRxOverrunCount;
+  if (overrunCount != g_reportedMcpRxOverrunCount) {
+    g_reportedMcpRxOverrunCount = overrunCount;
+    Serial.printf(
+        "MCP2515,ERR,RX_OVERRUN,EFLG=0x%02X,COUNT=%lu,DROPPED=%lu\n",
+        static_cast<uint8_t>(g_mcpLastOverrunEflg),
+        static_cast<unsigned long>(overrunCount),
+        static_cast<unsigned long>(g_mcpQueueDropCount));
+  }
+
+  const uint32_t readErrorCount = g_mcpRxReadErrorCount;
+  if (readErrorCount != g_reportedMcpRxReadErrorCount) {
+    g_reportedMcpRxReadErrorCount = readErrorCount;
+    Serial.printf(
+        "MCP2515,ERR,RX_READ,EFLG=0x%02X,CANINTF=0x%02X,COUNT=%lu\n",
+        static_cast<uint8_t>(g_mcpLastReadErrEflg),
+        static_cast<uint8_t>(g_mcpLastReadErrCanintf),
+        static_cast<unsigned long>(readErrorCount));
+  }
+
+  const uint32_t droppedCount = g_mcpQueueDropCount;
+  if (droppedCount != g_reportedMcpQueueDropCount) {
+    g_reportedMcpQueueDropCount = droppedCount;
+    Serial.printf("MCP2515,WARN,RX_QUEUE_DROP,COUNT=%lu\n", static_cast<unsigned long>(droppedCount));
+  }
 }
 
 bool initSdCard() {
   pinMode(kSdCsPin, OUTPUT);
   digitalWrite(kSdCsPin, HIGH);
+  pinMode(kMcp2515CsPin, OUTPUT);
+  digitalWrite(kMcp2515CsPin, HIGH);
 
-  if (!SD.begin(kSdCsPin, canSpi)) {
+  if (!takeCanSpiMutex()) {
+    Serial.println("SD,ERR,MUTEX");
+    return false;
+  }
+
+  const bool started = SD.begin(kSdCsPin, canSpi);
+  // Ensure SD is deselected after init on the shared HSPI bus.
+  digitalWrite(kSdCsPin, HIGH);
+  giveCanSpiMutex();
+  if (!started) {
     Serial.println("SD,ERR,INIT");
     return false;
   }
@@ -861,12 +1454,12 @@ void printTwaiFrame(const twai_message_t &message) {
   logLine(line);
 }
 
-void printMcpFrame(const can_frame &frame) {
+void printMcpFrame(const can_frame &frame, const uint32_t timestampMs) {
   const bool extended = (frame.can_id & CAN_EFF_FLAG) != 0;
   const uint32_t identifier = frame.can_id & (extended ? CAN_EFF_MASK : CAN_SFF_MASK);
 
   Serial.print("CAN2,");
-  Serial.print(millis());
+  Serial.print(timestampMs);
   Serial.print(',');
   Serial.print(extended ? "E," : "S,");
   if (extended) {
@@ -880,7 +1473,7 @@ void printMcpFrame(const can_frame &frame) {
   Serial.println();
 
   String line = "CAN2,";
-  line += String(millis());
+  line += String(timestampMs);
   line += ",";
   line += (extended ? "E," : "S,");
   line += String(identifier, HEX);
@@ -939,14 +1532,66 @@ void serviceTwaiStatus() {
       static_cast<unsigned long>(g_twaiRxFrameCount));
 }
 
-void serviceMcpRx() {
+uint32_t serviceMcpRx() {
   if (!g_mcpReady) {
-    return;
+    return 0;
+  }
+
+  const uint8_t errorFlags = mcp2515.getErrorFlags();
+  if ((errorFlags & (kMcp2515EflgRx0Ovr | kMcp2515EflgRx1Ovr)) != 0U) {
+    mcp2515.clearRxOverflow();
+    mcp2515.clearErrorInterrupts();
+    ++g_mcpRxOverrunCount;
+    g_mcpLastOverrunEflg = errorFlags;
   }
 
   can_frame frame = {};
-  while (mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
-    printMcpFrame(frame);
+  uint32_t drainedCount = 0;
+  while (true) {
+    const Mcp2515Driver::Error result = mcp2515.readMessage(&frame);
+    if (result != Mcp2515Driver::Error::Ok) {
+      if (result == Mcp2515Driver::Error::Fail) {
+        ++g_mcpRxReadErrorCount;
+        g_mcpLastReadErrEflg = mcp2515.getErrorFlags();
+        g_mcpLastReadErrCanintf = mcp2515.getInterruptFlags();
+      }
+      break;
+    }
+
+    ++drainedCount;
+    ++g_mcpRxFrameCount;
+    if (g_mcpServiceTaskHandle != nullptr && g_mcpRxQueue != nullptr) {
+      QueuedCanFrame queuedFrame = {};
+      queuedFrame.frame = frame;
+      queuedFrame.timestampMs = millis();
+      if (xQueueSend(g_mcpRxQueue, &queuedFrame, 0) != pdPASS) {
+        ++g_mcpQueueDropCount;
+      }
+    } else {
+      printMcpFrame(frame, millis());
+    }
+  }
+
+  return drainedCount;
+}
+
+void serviceMcpRxQueue() {
+  if (g_mcpRxQueue == nullptr) {
+    return;
+  }
+
+  QueuedCanFrame queuedFrame = {};
+  while (xQueueReceive(g_mcpRxQueue, &queuedFrame, 0) == pdTRUE) {
+    printMcpFrame(queuedFrame.frame, queuedFrame.timestampMs);
+  }
+}
+
+void mcpServiceTask(void *parameter) {
+  (void)parameter;
+  for (;;) {
+    serviceMcpRx();
+    // Keep polling latency low to avoid MCP RX overruns under bursty traffic.
+    taskYIELD();
   }
 }
 
@@ -983,9 +1628,13 @@ void sendMcpFrameRaw(const uint32_t identifier, const bool extended, const uint8
   frame.can_dlc = clampedLength;
   memcpy(frame.data, payload, clampedLength);
 
-  const MCP2515::ERROR result = mcp2515.sendMessage(&frame);
-  if (result != MCP2515::ERROR_OK && result != MCP2515::ERROR_ALLTXBUSY) {
-    Serial.printf("ERR,MCP_TX,%d\n", static_cast<int>(result));
+  const Mcp2515Driver::Error result = mcp2515.sendMessage(&frame);
+  if (result != Mcp2515Driver::Error::Ok && result != Mcp2515Driver::Error::AllTxBusy) {
+    Serial.printf(
+        "ERR,MCP_TX,EFLG=0x%02X,CANINTF=0x%02X,TEC=%u\n",
+        mcp2515.getErrorFlags(),
+        mcp2515.getInterruptFlags(),
+        mcp2515.getTransmitErrorCount());
   }
 }
 
@@ -1124,9 +1773,14 @@ void handleTxSerialCommand(const char *line) {
     }
   }
 
+  if (busSelector == '2') {
+    Serial.println("CMD,ERR,TX_CAN2_DISABLED");
+    return;
+  }
+
   const bool sendTwai = (busSelector == '1') || (busSelector == 'A') || (busSelector == 'B');
-  const bool sendMcp = (busSelector == '2') || (busSelector == 'B');
-  if (!sendTwai && !sendMcp) {
+  const bool sendMcp = false;
+  if (!sendTwai) {
     Serial.println("CMD,ERR,TX_BUS");
     return;
   }
@@ -1173,10 +1827,6 @@ void publishImuToCan(const ImuSample &sample) {
   sendTwaiFrame(kImuCanIdAccel, accelPayload, sizeof(accelPayload));
   sendTwaiFrame(kImuCanIdGyro, gyroPayload, sizeof(gyroPayload));
   sendTwaiFrame(kImuCanIdStatus, statusPayload, sizeof(statusPayload));
-
-  sendMcpFrame(kImuCanIdAccel, accelPayload, sizeof(accelPayload));
-  sendMcpFrame(kImuCanIdGyro, gyroPayload, sizeof(gyroPayload));
-  sendMcpFrame(kImuCanIdStatus, statusPayload, sizeof(statusPayload));
 }
 
 void printImuSample(const ImuSample &sample) {
@@ -1253,15 +1903,47 @@ void setup() {
 
   Serial.println("BOOT,TELEMETRY,START");
 
+  g_canSpiMutex = xSemaphoreCreateMutex();
+  if (g_canSpiMutex == nullptr) {
+    Serial.println("BOOT,ERR,CAN_SPI_MUTEX");
+  }
+
   g_twaiReady = initTwai();
   g_mcpReady = initMcp2515();
+  if (g_mcpReady) {
+    g_mcpRxQueue = xQueueCreate(kMcpRxQueueDepth, sizeof(QueuedCanFrame));
+    if (g_mcpRxQueue == nullptr) {
+      Serial.println("BOOT,MCP2515,ERR,RX_QUEUE");
+    }
+  }
   g_sdReady = initSdCard();
   g_sdError = !g_sdReady;
-  g_imuReady = initAsm330();
-  if (!g_imuReady) {
-    g_asm330LastInitSucceeded = false;
-    g_asm330InitFailureCount++;
-    printAsm330InitState("ASM330,INIT,STATE");
+  if (kEnableAsm330Runtime) {
+    g_imuReady = initAsm330();
+    if (!g_imuReady) {
+      g_asm330LastInitSucceeded = false;
+      g_asm330InitFailureCount++;
+      printAsm330InitState("ASM330,INIT,STATE");
+    }
+  } else {
+    g_imuReady = false;
+    Serial.println("BOOT,ASM330,DISABLED");
+  }
+
+  if (g_mcpReady && g_mcpRxQueue != nullptr) {
+    if (xTaskCreatePinnedToCore(
+            mcpServiceTask,
+            "mcp-service",
+            kMcpServiceTaskStack,
+            nullptr,
+            kMcpServiceTaskPriority,
+            &g_mcpServiceTaskHandle,
+            kMcpServiceTaskCore) != pdPASS) {
+      Serial.println("BOOT,MCP2515,ERR,TASK");
+      g_mcpServiceTaskHandle = nullptr;
+          vQueueDelete(g_mcpRxQueue);
+          g_mcpRxQueue = nullptr;
+    }
   }
 
   if (g_recordingRequested && g_sdReady && !g_sdError) {
@@ -1270,7 +1952,7 @@ void setup() {
 
   Serial.printf("BOOT,RECORD,%s\n", g_recordingRequested ? "ON" : "OFF");
 
-  if (!g_imuReady || !g_twaiReady || !g_mcpReady) {
+  if (!g_twaiReady || !g_mcpReady || (kEnableAsm330Runtime && !g_imuReady)) {
     Serial.println("BOOT,WARN,SUBSYSTEM_NOT_READY");
   }
 }
@@ -1280,16 +1962,26 @@ void loop() {
   serviceRecordButton();
   serviceRecordingState();
   updateLeds();
+  serviceMcpRxQueue();
   serviceTwaiRx();
+  serviceMcpRxQueue();
   serviceTwaiStatus();
-  serviceMcpRx();
-  serviceAsm330InitRetry();
-  serviceAsm330Debug();
+  if (g_mcpServiceTaskHandle == nullptr) {
+    serviceMcpRx();
+  }
+  serviceMcpRxQueue();
+  serviceMcpErrorReport();
+  serviceMcpStatus();
+  serviceMcpRecovery();
+  if (kEnableAsm330Runtime) {
+    serviceAsm330InitRetry();
+    serviceAsm330Debug();
 
-  ImuSample sample = {};
-  if (readAsm330Sample(sample)) {
-    ++g_sampleCounter;
-    printImuSample(sample);
-    publishImuToCan(sample);
+    ImuSample sample = {};
+    if (readAsm330Sample(sample)) {
+      ++g_sampleCounter;
+      printImuSample(sample);
+      publishImuToCan(sample);
+    }
   }
 }
