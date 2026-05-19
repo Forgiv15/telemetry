@@ -369,6 +369,8 @@ class TelemetryWindow(QMainWindow):
         self.asm_fields: dict[str, str] = {}
         self.asm_init_event_text = "No manual init command sent"
         self.last_imu_text = "No IMU samples yet"
+        self.sd_fields: dict[str, str] = {}
+        self.sd_last_event_text = "No SD events yet"
 
         self._build_ui()
 
@@ -432,16 +434,19 @@ class TelemetryWindow(QMainWindow):
         self.overview_tab = QWidget()
         self.pdu_tab = QWidget()
         self.asm_tab = QWidget()
+        self.sd_tab = QWidget()
         self.raw_tab = QWidget()
 
         self.tabs.addTab(self.overview_tab, "Overview")
         self.tabs.addTab(self.pdu_tab, "PDU Control + Diagnostics")
         self.tabs.addTab(self.asm_tab, "ASM330 Debug")
+        self.tabs.addTab(self.sd_tab, "SD Logging")
         self.tabs.addTab(self.raw_tab, "Raw")
 
         self._build_overview_tab()
         self._build_pdu_tab()
         self._build_asm_tab()
+        self._build_sd_tab()
         self._build_raw_tab()
 
     def _build_overview_tab(self):
@@ -749,6 +754,62 @@ class TelemetryWindow(QMainWindow):
         self.asm_log.setMaximumBlockCount(1200)
         layout.addWidget(self.asm_log)
 
+    def _build_sd_tab(self):
+        layout = QVBoxLayout(self.sd_tab)
+
+        cmd_row = QHBoxLayout()
+
+        sd_on_btn = QPushButton("Start Recording")
+        sd_on_btn.clicked.connect(lambda: self._send_serial_line("SDREC ON"))
+        cmd_row.addWidget(sd_on_btn)
+
+        sd_off_btn = QPushButton("Stop Recording")
+        sd_off_btn.clicked.connect(lambda: self._send_serial_line("SDREC OFF"))
+        cmd_row.addWidget(sd_off_btn)
+
+        sd_toggle_btn = QPushButton("Toggle")
+        sd_toggle_btn.clicked.connect(lambda: self._send_serial_line("SDREC TOGGLE"))
+        cmd_row.addWidget(sd_toggle_btn)
+
+        sd_state_btn = QPushButton("Read SD State")
+        sd_state_btn.clicked.connect(lambda: self._send_serial_line("SDSTATE"))
+        cmd_row.addWidget(sd_state_btn)
+
+        clear_btn = QPushButton("Clear SD Log")
+        clear_btn.clicked.connect(lambda: self.sd_log.clear())
+        cmd_row.addWidget(clear_btn)
+        cmd_row.addStretch()
+        layout.addLayout(cmd_row)
+
+        status_box = QGroupBox("SD Status")
+        status_layout = QFormLayout(status_box)
+        self.sd_record_state_label = QLabel("--")
+        self.sd_ready_label = QLabel("--")
+        self.sd_error_label = QLabel("--")
+        self.sd_req_label = QLabel("--")
+        self.sd_active_label = QLabel("--")
+        self.sd_open_label = QLabel("--")
+        self.sd_next_index_label = QLabel("--")
+        self.sd_last_file_label = QLabel("--")
+        self.sd_last_event_label = QLabel(self.sd_last_event_text)
+        self.sd_last_event_label.setWordWrap(True)
+
+        status_layout.addRow("Recording:", self.sd_record_state_label)
+        status_layout.addRow("Card ready:", self.sd_ready_label)
+        status_layout.addRow("Error state:", self.sd_error_label)
+        status_layout.addRow("Request flag:", self.sd_req_label)
+        status_layout.addRow("Active flag:", self.sd_active_label)
+        status_layout.addRow("File open:", self.sd_open_label)
+        status_layout.addRow("Next LOG index:", self.sd_next_index_label)
+        status_layout.addRow("Last opened file:", self.sd_last_file_label)
+        status_layout.addRow("Last event:", self.sd_last_event_label)
+        layout.addWidget(status_box)
+
+        self.sd_log = QPlainTextEdit()
+        self.sd_log.setReadOnly(True)
+        self.sd_log.setMaximumBlockCount(3000)
+        layout.addWidget(self.sd_log)
+
     def _build_raw_tab(self):
         layout = QVBoxLayout(self.raw_tab)
 
@@ -788,6 +849,8 @@ class TelemetryWindow(QMainWindow):
     def _on_serial_status(self, ok: bool, text: str):
         self.status_label.setText(text)
         self.status_label.setStyleSheet("font-weight:700; color:#0a7f2e;" if ok else "font-weight:700; color:#b00020;")
+        if ok:
+            self._send_serial_line("SDSTATE")
 
     def _on_serial_line(self, line: str):
         self.rx_queue.put(line)
@@ -941,6 +1004,10 @@ class TelemetryWindow(QMainWindow):
             self._handle_prefixed_can_line(line)
             return
 
+        if line.startswith("SD,") or line.startswith("BOOT,RECORD,"):
+            self._handle_sd_line(line)
+            return
+
         if line.startswith("IMU,"):
             self._handle_imu_line(line)
             return
@@ -951,6 +1018,51 @@ class TelemetryWindow(QMainWindow):
 
         if line.startswith("CMD,"):
             self.asm_log.appendPlainText(line)
+
+    def _handle_sd_line(self, line: str):
+        self.sd_log.appendPlainText(line)
+        self.sd_last_event_text = line
+
+        if line.startswith("SD,OK"):
+            self.sd_fields["READY"] = "1"
+            self.sd_fields["ERR"] = "0"
+            return
+
+        if line.startswith("SD,ERR,"):
+            self.sd_fields["ERR"] = "1"
+            return
+
+        if line.startswith("SD,RECORD,ON"):
+            self.sd_fields["REQ"] = "1"
+            return
+
+        if line.startswith("SD,RECORD,OFF"):
+            self.sd_fields["REQ"] = "0"
+            self.sd_fields["ACTIVE"] = "0"
+            return
+
+        if line.startswith("SD,LOG_OPEN,"):
+            self.sd_fields["OPEN"] = "1"
+            self.sd_fields["ACTIVE"] = "1"
+            self.sd_fields["LAST_FILE"] = line.split(",", 2)[2].strip()
+            return
+
+        if line.startswith("SD,LOG_CLOSED"):
+            self.sd_fields["OPEN"] = "0"
+            self.sd_fields["ACTIVE"] = "0"
+            return
+
+        if line.startswith("BOOT,RECORD,"):
+            req_on = line.endswith(",ON")
+            self.sd_fields["REQ"] = "1" if req_on else "0"
+            return
+
+        if line.startswith("SD,STATE,"):
+            for part in line.split(",")[2:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                self.sd_fields[key.strip()] = value.strip()
 
     def _handle_prefixed_can_line(self, line: str):
         parts = line.split(",", 5)
@@ -1240,6 +1352,29 @@ class TelemetryWindow(QMainWindow):
         self.asm_nosample_label.setText(self.asm_fields.get("NOSAMPLE", "--"))
         self.asm_drdy_label.setText(self.asm_fields.get("DRDY_PIN", "--"))
         self.asm_init_event_label.setText(self.asm_init_event_text)
+
+        sd_ready = self.sd_fields.get("READY", "--")
+        sd_err = self.sd_fields.get("ERR", "--")
+        sd_req = self.sd_fields.get("REQ", "--")
+        sd_active = self.sd_fields.get("ACTIVE", "--")
+        sd_open = self.sd_fields.get("OPEN", "--")
+        sd_next_index = self.sd_fields.get("NEXT_INDEX", "--")
+        sd_last_file = self.sd_fields.get("LAST_FILE", "--")
+
+        self.sd_ready_label.setText(sd_ready)
+        self.sd_error_label.setText(sd_err)
+        self.sd_req_label.setText(sd_req)
+        self.sd_active_label.setText(sd_active)
+        self.sd_open_label.setText(sd_open)
+        self.sd_next_index_label.setText(sd_next_index)
+        self.sd_last_file_label.setText(sd_last_file)
+        self.sd_last_event_label.setText(self.sd_last_event_text)
+
+        recording_active = sd_active == "1"
+        self.sd_record_state_label.setText("RECORDING" if recording_active else "IDLE")
+        self.sd_record_state_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if recording_active else "font-weight:700; color:#666;"
+        )
 
     def _refresh_output_check_colors(self):
         for i, cb in enumerate(self.output_checks):

@@ -563,6 +563,7 @@ uint32_t g_buttonLastTransitionMs = 0;
 uint16_t g_logFileIndex = 0;
 uint32_t g_lastAsm330DebugMs = 0;
 uint32_t g_lastTwaiStatusMs = 0;
+uint32_t g_logLineCount = 0;
 uint32_t g_twaiRxFrameCount = 0;
 volatile uint32_t g_mcpRxFrameCount = 0;
 volatile uint32_t g_mcpRxOverrunCount = 0;
@@ -655,6 +656,18 @@ bool isRecordingActive() {
   return g_recordingRequested && g_sdReady && !g_sdError && static_cast<bool>(g_logFile);
 }
 
+void printSdState(const char *prefix) {
+  Serial.printf(
+      "%s,READY=%u,ERR=%u,REQ=%u,ACTIVE=%u,OPEN=%u,NEXT_INDEX=%u\n",
+      prefix,
+      g_sdReady ? 1U : 0U,
+      g_sdError ? 1U : 0U,
+      g_recordingRequested ? 1U : 0U,
+      isRecordingActive() ? 1U : 0U,
+      static_cast<bool>(g_logFile) ? 1U : 0U,
+      static_cast<unsigned int>(g_logFileIndex));
+}
+
 bool openLogFile() {
   if (!g_sdReady || g_sdError || static_cast<bool>(g_logFile)) {
     return false;
@@ -678,6 +691,7 @@ bool openLogFile() {
       giveCanSpiMutex();
       if (g_logFile) {
         g_logFileIndex = idx + 1;
+        g_logLineCount = 0;
         g_logFile.println("TYPE,MS,IDTYPE,ID,DLC,DATA");
         g_logFile.flush();
         Serial.printf("SD,LOG_OPEN,%s\n", fileName);
@@ -730,7 +744,8 @@ bool logLine(const String &line) {
     return false;
   }
 
-  if ((g_sampleCounter % 32U) == 0U) {
+  ++g_logLineCount;
+  if ((g_logLineCount % 32U) == 0U) {
     g_logFile.flush();
   }
 
@@ -1324,6 +1339,65 @@ void serviceAsm330Debug() {
   }
 }
 
+void setSdRecordingFromSerial(const bool enable) {
+  if (enable) {
+    g_recordingRequested = true;
+    Serial.println("SD,RECORD,ON,SRC=SERIAL");
+
+    if (!g_sdReady || g_sdError) {
+      Serial.println("SD,RECORD,REJECTED");
+      printSdState("SD,STATE");
+      return;
+    }
+
+    if (!static_cast<bool>(g_logFile)) {
+      openLogFile();
+    }
+
+    printSdState("SD,STATE");
+    return;
+  }
+
+  g_recordingRequested = false;
+  closeLogFile();
+  Serial.println("SD,RECORD,OFF,SRC=SERIAL");
+  printSdState("SD,STATE");
+}
+
+bool handleSdSerialCommand(const char *line) {
+  if (strcmp(line, "SDSTATE") == 0) {
+    printSdState("SD,STATE");
+    return true;
+  }
+
+  if (strcmp(line, "SDREC ON") == 0) {
+    setSdRecordingFromSerial(true);
+    return true;
+  }
+
+  if (strcmp(line, "SDREC OFF") == 0) {
+    setSdRecordingFromSerial(false);
+    return true;
+  }
+
+  if (strcmp(line, "SDREC TOGGLE") == 0) {
+    setSdRecordingFromSerial(!g_recordingRequested);
+    return true;
+  }
+
+  if (strcmp(line, "SDHELP") == 0) {
+    Serial.println("SD,CMD,SDSTATE|SDREC ON|SDREC OFF|SDREC TOGGLE");
+    return true;
+  }
+
+  if (strncmp(line, "SD", 2) == 0) {
+    Serial.printf("SD,ERR,UNKNOWN_CMD,%s\n", line);
+    return true;
+  }
+
+  return false;
+}
+
 void handleAsm330SerialCommand(const char *line) {
   if (strcmp(line, "ASMDBG") == 0) {
     printAsm330DebugSnapshot("ASMDBG,CMD");
@@ -1394,6 +1468,8 @@ void serviceSerialCommands() {
       g_serialCommandBuffer[g_serialCommandLength] = '\0';
       if (strncmp(g_serialCommandBuffer, "TX,", 3) == 0) {
         handleTxSerialCommand(g_serialCommandBuffer);
+      } else if (handleSdSerialCommand(g_serialCommandBuffer)) {
+        // SD command was handled.
       } else {
         handleAsm330SerialCommand(g_serialCommandBuffer);
       }
@@ -1918,6 +1994,7 @@ void setup() {
   }
   g_sdReady = initSdCard();
   g_sdError = !g_sdReady;
+  printSdState("SD,STATE");
   if (kEnableAsm330Runtime) {
     g_imuReady = initAsm330();
     if (!g_imuReady) {
