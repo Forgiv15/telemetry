@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -49,6 +50,9 @@ CAN_ID_MCU = 0x740
 
 CAN_BUS_BITRATE_BPS = 500_000
 CAN_UTIL_WINDOW_S = 1.0
+SERIAL_BITS_PER_BYTE = 10
+SERIAL_UTIL_WINDOW_S = 1.0
+SD_STATE_POLL_MS = 2000
 
 CONTROL_MAGIC = 0xA5
 CONTROL_OP_NOP = 0x00
@@ -95,7 +99,7 @@ TPS_STATUS_CML_BITS = [
 ]
 
 HISTORY_LEN = 240
-CAN_COMPARE_TIMEOUT_S = 0.35
+CAN_COMPARE_TIMEOUT_MS = 350
 
 
 @dataclass(frozen=True)
@@ -316,16 +320,21 @@ class TelemetryWindow(QMainWindow):
         self.rx_frames_can1 = 0
         self.rx_frames_can2 = 0
         self.rx_frames_total = 0
-        self.can_compare_pending_can1: dict[tuple[int, int, tuple[int, ...]], deque[float]] = {}
-        self.can_compare_pending_can2: dict[tuple[int, int, tuple[int, ...]], deque[float]] = {}
+        self.can_compare_pending_can1: dict[tuple[int, int, tuple[int, ...]], deque[int]] = {}
+        self.can_compare_pending_can2: dict[tuple[int, int, tuple[int, ...]], deque[int]] = {}
         self.can_compare_match_count = 0
         self.can_compare_miss_count = 0
+        self.last_can_timestamp_ms = 0
         self.last_fps_reset = time.monotonic()
         self.fps_counter = 0
         self.can_bits_window_can1: deque[tuple[float, int]] = deque()
         self.can_bits_window_can2: deque[tuple[float, int]] = deque()
         self.can_utilization_can1 = 0.0
         self.can_utilization_can2 = 0.0
+        self.serial_bits_window: deque[tuple[float, int]] = deque()
+        self.serial_utilization = 0.0
+        self.serial_rx_bytes_total = 0
+        self.serial_tx_bytes_total = 0
 
         self.pdu_control_state_flags = 0
         self.pdu_requested_mask = 0
@@ -371,6 +380,15 @@ class TelemetryWindow(QMainWindow):
         self.last_imu_text = "No IMU samples yet"
         self.sd_fields: dict[str, str] = {}
         self.sd_last_event_text = "No SD events yet"
+        self.csv_log_summary_text = "No CSV log loaded"
+        self.modem_fields: dict[str, str] = {}
+        self.mqtt_fields: dict[str, str] = {}
+        self.gnss_fields: dict[str, str] = {}
+        self.ntrip_fields: dict[str, str] = {}
+        self.modem_last_event_text = "No modem events yet"
+        self.mqtt_last_event_text = "No MQTT events yet"
+        self.gnss_last_event_text = "No GNSS events yet"
+        self.ntrip_last_event_text = "No NTRIP events yet"
 
         self._build_ui()
 
@@ -390,6 +408,10 @@ class TelemetryWindow(QMainWindow):
         self.keepalive_timer = QTimer(self)
         self.keepalive_timer.timeout.connect(self._send_pdu_keepalive)
         self.keepalive_timer.start(120)
+
+        self.sd_poll_timer = QTimer(self)
+        self.sd_poll_timer.timeout.connect(self._poll_sd_state)
+        self.sd_poll_timer.start(SD_STATE_POLL_MS)
 
         self._refresh_ports()
 
@@ -435,18 +457,24 @@ class TelemetryWindow(QMainWindow):
         self.pdu_tab = QWidget()
         self.asm_tab = QWidget()
         self.sd_tab = QWidget()
+        self.modem_tab = QWidget()
+        self.gnss_tab = QWidget()
         self.raw_tab = QWidget()
 
         self.tabs.addTab(self.overview_tab, "Overview")
         self.tabs.addTab(self.pdu_tab, "PDU Control + Diagnostics")
         self.tabs.addTab(self.asm_tab, "ASM330 Debug")
         self.tabs.addTab(self.sd_tab, "SD Logging")
+        self.tabs.addTab(self.modem_tab, "4G Modem")
+        self.tabs.addTab(self.gnss_tab, "GNSS RTK")
         self.tabs.addTab(self.raw_tab, "Raw")
 
         self._build_overview_tab()
         self._build_pdu_tab()
         self._build_asm_tab()
         self._build_sd_tab()
+        self._build_modem_tab()
+        self._build_gnss_tab()
         self._build_raw_tab()
 
     def _build_overview_tab(self):
@@ -495,6 +523,15 @@ class TelemetryWindow(QMainWindow):
         util_row.addWidget(self.can2_util_bar)
         self.can2_util_label = QLabel("0.0%")
         util_row.addWidget(self.can2_util_label)
+
+        util_row.addSpacing(12)
+        util_row.addWidget(QLabel("Serial utilization:"))
+        self.serial_util_bar = QProgressBar()
+        self.serial_util_bar.setRange(0, 100)
+        self.serial_util_bar.setFormat("%p%")
+        util_row.addWidget(self.serial_util_bar)
+        self.serial_util_label = QLabel("0.0%")
+        util_row.addWidget(self.serial_util_label)
         util_row.addStretch()
         layout.addLayout(util_row)
 
@@ -778,14 +815,22 @@ class TelemetryWindow(QMainWindow):
         clear_btn = QPushButton("Clear SD Log")
         clear_btn.clicked.connect(lambda: self.sd_log.clear())
         cmd_row.addWidget(clear_btn)
+
+        load_csv_btn = QPushButton("Load CSV Log")
+        load_csv_btn.clicked.connect(self._load_csv_log)
+        cmd_row.addWidget(load_csv_btn)
         cmd_row.addStretch()
         layout.addLayout(cmd_row)
 
         status_box = QGroupBox("SD Status")
         status_layout = QFormLayout(status_box)
         self.sd_record_state_label = QLabel("--")
+        self.sd_card_present_label = QLabel("--")
+        self.sd_health_label = QLabel("--")
         self.sd_ready_label = QLabel("--")
         self.sd_error_label = QLabel("--")
+        self.sd_read_ok_label = QLabel("--")
+        self.sd_write_ok_label = QLabel("--")
         self.sd_req_label = QLabel("--")
         self.sd_active_label = QLabel("--")
         self.sd_open_label = QLabel("--")
@@ -795,8 +840,12 @@ class TelemetryWindow(QMainWindow):
         self.sd_last_event_label.setWordWrap(True)
 
         status_layout.addRow("Recording:", self.sd_record_state_label)
+        status_layout.addRow("Card present:", self.sd_card_present_label)
+        status_layout.addRow("Health:", self.sd_health_label)
         status_layout.addRow("Card ready:", self.sd_ready_label)
         status_layout.addRow("Error state:", self.sd_error_label)
+        status_layout.addRow("Readable:", self.sd_read_ok_label)
+        status_layout.addRow("Writable:", self.sd_write_ok_label)
         status_layout.addRow("Request flag:", self.sd_req_label)
         status_layout.addRow("Active flag:", self.sd_active_label)
         status_layout.addRow("File open:", self.sd_open_label)
@@ -809,6 +858,15 @@ class TelemetryWindow(QMainWindow):
         self.sd_log.setReadOnly(True)
         self.sd_log.setMaximumBlockCount(3000)
         layout.addWidget(self.sd_log)
+
+        self.csv_log_summary_label = QLabel(self.csv_log_summary_text)
+        self.csv_log_summary_label.setWordWrap(True)
+        layout.addWidget(self.csv_log_summary_label)
+
+        self.csv_log_preview = QPlainTextEdit()
+        self.csv_log_preview.setReadOnly(True)
+        self.csv_log_preview.setMaximumBlockCount(1200)
+        layout.addWidget(self.csv_log_preview)
 
     def _build_raw_tab(self):
         layout = QVBoxLayout(self.raw_tab)
@@ -827,6 +885,269 @@ class TelemetryWindow(QMainWindow):
         self.raw_log.setReadOnly(True)
         self.raw_log.setMaximumBlockCount(5000)
         layout.addWidget(self.raw_log)
+
+    def _build_modem_tab(self):
+        layout = QVBoxLayout(self.modem_tab)
+
+        cmd_row = QHBoxLayout()
+        for text, cmd in [
+            ("Read Modem State", "MODEMSTATE"),
+            ("Connect PDP", "MODEMCONNECT"),
+            ("Disconnect PDP", "MODEMDISCONNECT"),
+            ("Pulse PWRKEY", "MODEMPWRKEY"),
+            ("Reset Modem", "MODEMRESET"),
+            ("Read MQTT State", "MQTTSTATE"),
+            ("MQTT On", "MQTTON"),
+            ("MQTT Off", "MQTTOFF"),
+        ]:
+            btn = QPushButton(text)
+            btn.clicked.connect(lambda _, c=cmd: self._send_serial_line(c))
+            cmd_row.addWidget(btn)
+
+        clear_btn = QPushButton("Clear Modem Log")
+        clear_btn.clicked.connect(lambda: self.modem_log.clear())
+        cmd_row.addWidget(clear_btn)
+        cmd_row.addStretch()
+        layout.addLayout(cmd_row)
+
+        apn_box = QGroupBox("APN Configuration")
+        apn_layout = QGridLayout(apn_box)
+        self.apn_input = QLineEdit()
+        self.apn_user_input = QLineEdit()
+        self.apn_pass_input = QLineEdit()
+        self.apn_pass_input.setEchoMode(QLineEdit.Password)
+        apn_layout.addWidget(QLabel("APN:"), 0, 0)
+        apn_layout.addWidget(self.apn_input, 0, 1)
+        apn_layout.addWidget(QLabel("User:"), 0, 2)
+        apn_layout.addWidget(self.apn_user_input, 0, 3)
+        apn_layout.addWidget(QLabel("Pass:"), 0, 4)
+        apn_layout.addWidget(self.apn_pass_input, 0, 5)
+        apn_btn = QPushButton("Apply APN")
+        apn_btn.clicked.connect(self._send_modem_apn)
+        apn_layout.addWidget(apn_btn, 0, 6)
+        layout.addWidget(apn_box)
+
+        http_box = QGroupBox("HTTP Connectivity Test")
+        http_layout = QGridLayout(http_box)
+        self.http_host_input = QLineEdit("example.com")
+        self.http_path_input = QLineEdit("/")
+        http_layout.addWidget(QLabel("Host:"), 0, 0)
+        http_layout.addWidget(self.http_host_input, 0, 1)
+        http_layout.addWidget(QLabel("Path:"), 0, 2)
+        http_layout.addWidget(self.http_path_input, 0, 3)
+        http_btn = QPushButton("Run HTTP Test")
+        http_btn.clicked.connect(self._send_modem_http_test)
+        http_layout.addWidget(http_btn, 0, 4)
+        layout.addWidget(http_box)
+
+        mqtt_cfg_box = QGroupBox("MQTT Broker Configuration")
+        mqtt_cfg_layout = QGridLayout(mqtt_cfg_box)
+        self.mqtt_host_input = QLineEdit("9ddfaf6f481045449c7efc293f3a389f.s1.eu.hivemq.cloud")
+        self.mqtt_port_input = QLineEdit("8883")
+        self.mqtt_client_input = QLineEdit("telemetry-node")
+        self.mqtt_prefix_input = QLineEdit("szen/telemetry/node")
+        mqtt_cfg_layout.addWidget(QLabel("Host:"), 0, 0)
+        mqtt_cfg_layout.addWidget(self.mqtt_host_input, 0, 1)
+        mqtt_cfg_layout.addWidget(QLabel("Port:"), 0, 2)
+        mqtt_cfg_layout.addWidget(self.mqtt_port_input, 0, 3)
+        mqtt_cfg_layout.addWidget(QLabel("Client ID:"), 1, 0)
+        mqtt_cfg_layout.addWidget(self.mqtt_client_input, 1, 1)
+        mqtt_cfg_layout.addWidget(QLabel("Topic prefix:"), 1, 2)
+        mqtt_cfg_layout.addWidget(self.mqtt_prefix_input, 1, 3)
+        mqtt_cfg_btn = QPushButton("Apply MQTT Endpoint")
+        mqtt_cfg_btn.clicked.connect(self._send_mqtt_config)
+        mqtt_cfg_layout.addWidget(mqtt_cfg_btn, 0, 4, 2, 1)
+        layout.addWidget(mqtt_cfg_box)
+
+        mqtt_auth_box = QGroupBox("MQTT Authentication")
+        mqtt_auth_layout = QGridLayout(mqtt_auth_box)
+        self.mqtt_user_input = QLineEdit()
+        self.mqtt_pass_input = QLineEdit()
+        self.mqtt_pass_input.setEchoMode(QLineEdit.Password)
+        mqtt_auth_layout.addWidget(QLabel("User:"), 0, 0)
+        mqtt_auth_layout.addWidget(self.mqtt_user_input, 0, 1)
+        mqtt_auth_layout.addWidget(QLabel("Pass:"), 0, 2)
+        mqtt_auth_layout.addWidget(self.mqtt_pass_input, 0, 3)
+        mqtt_auth_btn = QPushButton("Apply MQTT Auth")
+        mqtt_auth_btn.clicked.connect(self._send_mqtt_auth)
+        mqtt_auth_layout.addWidget(mqtt_auth_btn, 0, 4)
+        layout.addWidget(mqtt_auth_box)
+
+        status_box = QGroupBox("Modem State")
+        status_layout = QFormLayout(status_box)
+        self.modem_uart_label = QLabel("--")
+        self.modem_uart_baud_label = QLabel("--")
+        self.modem_uart_target_label = QLabel("--")
+        self.modem_uart_probe_label = QLabel("--")
+        self.modem_uart_flow_label = QLabel("--")
+        self.modem_uart_high_label = QLabel("--")
+        self.modem_ready_label = QLabel("--")
+        self.modem_sim_label = QLabel("--")
+        self.modem_network_label = QLabel("--")
+        self.modem_gprs_label = QLabel("--")
+        self.modem_internet_label = QLabel("--")
+        self.modem_signal_label = QLabel("--")
+        self.modem_http_code_label = QLabel("--")
+        self.modem_apn_label = QLabel("--")
+        self.modem_ip_label = QLabel("--")
+        self.modem_operator_label = QLabel("--")
+        self.modem_info_label = QLabel("--")
+        self.modem_boot_timer_label = QLabel("possibly not booted modem")
+        self.modem_event_label = QLabel(self.modem_last_event_text)
+        self.modem_event_label.setWordWrap(True)
+        status_layout.addRow("UART ready:", self.modem_uart_label)
+        status_layout.addRow("UART baud:", self.modem_uart_baud_label)
+        status_layout.addRow("UART target:", self.modem_uart_target_label)
+        status_layout.addRow("Last UART probe:", self.modem_uart_probe_label)
+        status_layout.addRow("Flow control:", self.modem_uart_flow_label)
+        status_layout.addRow("High-speed UART:", self.modem_uart_high_label)
+        status_layout.addRow("Modem ready:", self.modem_ready_label)
+        status_layout.addRow("SIM ready:", self.modem_sim_label)
+        status_layout.addRow("Network attached:", self.modem_network_label)
+        status_layout.addRow("PDP / GPRS:", self.modem_gprs_label)
+        status_layout.addRow("Internet test:", self.modem_internet_label)
+        status_layout.addRow("Signal quality:", self.modem_signal_label)
+        status_layout.addRow("HTTP status:", self.modem_http_code_label)
+        status_layout.addRow("APN:", self.modem_apn_label)
+        status_layout.addRow("Local IP:", self.modem_ip_label)
+        status_layout.addRow("Operator:", self.modem_operator_label)
+        status_layout.addRow("Modem info:", self.modem_info_label)
+        status_layout.addRow("12s boot timer:", self.modem_boot_timer_label)
+        status_layout.addRow("Last event:", self.modem_event_label)
+        layout.addWidget(status_box)
+
+        mqtt_state_box = QGroupBox("MQTT State")
+        mqtt_state_layout = QFormLayout(mqtt_state_box)
+        self.mqtt_cfg_label = QLabel("--")
+        self.mqtt_enabled_label = QLabel("--")
+        self.mqtt_socket_label = QLabel("--")
+        self.mqtt_endpoint_label = QLabel("--")
+        self.mqtt_prefix_label = QLabel("--")
+        self.mqtt_tx_label = QLabel("--")
+        self.mqtt_rx_label = QLabel("--")
+        self.mqtt_reconnect_label = QLabel("--")
+        self.mqtt_dropped_label = QLabel("--")
+        self.mqtt_event_label = QLabel(self.mqtt_last_event_text)
+        self.mqtt_event_label.setWordWrap(True)
+        mqtt_state_layout.addRow("Configured:", self.mqtt_cfg_label)
+        mqtt_state_layout.addRow("Enabled:", self.mqtt_enabled_label)
+        mqtt_state_layout.addRow("Socket:", self.mqtt_socket_label)
+        mqtt_state_layout.addRow("Endpoint:", self.mqtt_endpoint_label)
+        mqtt_state_layout.addRow("Topic prefix:", self.mqtt_prefix_label)
+        mqtt_state_layout.addRow("TX count:", self.mqtt_tx_label)
+        mqtt_state_layout.addRow("RX count:", self.mqtt_rx_label)
+        mqtt_state_layout.addRow("Reconnects:", self.mqtt_reconnect_label)
+        mqtt_state_layout.addRow("Dropped inbound:", self.mqtt_dropped_label)
+        mqtt_state_layout.addRow("Last MQTT event:", self.mqtt_event_label)
+        layout.addWidget(mqtt_state_box)
+
+        self.modem_log = QPlainTextEdit()
+        self.modem_log.setReadOnly(True)
+        self.modem_log.setMaximumBlockCount(2000)
+        layout.addWidget(self.modem_log)
+
+    def _build_gnss_tab(self):
+        layout = QVBoxLayout(self.gnss_tab)
+
+        cmd_row = QHBoxLayout()
+        for text, cmd in [
+            ("Read GNSS State", "GNSSSTATE"),
+            ("Reset GNSS", "GNSSRESET"),
+            ("Read NTRIP State", "NTRIPSTATE"),
+            ("Start NTRIP", "NTRIPON"),
+            ("Stop NTRIP", "NTRIPOFF"),
+        ]:
+            btn = QPushButton(text)
+            btn.clicked.connect(lambda _, c=cmd: self._send_serial_line(c))
+            cmd_row.addWidget(btn)
+
+        clear_btn = QPushButton("Clear GNSS Log")
+        clear_btn.clicked.connect(lambda: self.gnss_log.clear())
+        cmd_row.addWidget(clear_btn)
+        cmd_row.addStretch()
+        layout.addLayout(cmd_row)
+
+        ntrip_box = QGroupBox("NTRIP Configuration")
+        ntrip_layout = QGridLayout(ntrip_box)
+        self.ntrip_host_input = QLineEdit()
+        self.ntrip_port_input = QLineEdit("2101")
+        self.ntrip_mount_input = QLineEdit()
+        self.ntrip_user_input = QLineEdit()
+        self.ntrip_pass_input = QLineEdit()
+        self.ntrip_pass_input.setEchoMode(QLineEdit.Password)
+        ntrip_layout.addWidget(QLabel("Host:"), 0, 0)
+        ntrip_layout.addWidget(self.ntrip_host_input, 0, 1)
+        ntrip_layout.addWidget(QLabel("Port:"), 0, 2)
+        ntrip_layout.addWidget(self.ntrip_port_input, 0, 3)
+        ntrip_layout.addWidget(QLabel("Mount:"), 0, 4)
+        ntrip_layout.addWidget(self.ntrip_mount_input, 0, 5)
+        ntrip_layout.addWidget(QLabel("User:"), 1, 0)
+        ntrip_layout.addWidget(self.ntrip_user_input, 1, 1)
+        ntrip_layout.addWidget(QLabel("Pass:"), 1, 2)
+        ntrip_layout.addWidget(self.ntrip_pass_input, 1, 3)
+        ntrip_btn = QPushButton("Apply NTRIP Config")
+        ntrip_btn.clicked.connect(self._send_ntrip_config)
+        ntrip_layout.addWidget(ntrip_btn, 1, 5)
+        layout.addWidget(ntrip_box)
+
+        gnss_box = QGroupBox("GNSS State")
+        gnss_layout = QFormLayout(gnss_box)
+        self.gnss_uart_label = QLabel("--")
+        self.gnss_ready_label = QLabel("--")
+        self.gnss_cfg_label = QLabel("--")
+        self.gnss_baud_label = QLabel("--")
+        self.gnss_fix_label = QLabel("--")
+        self.gnss_carrier_label = QLabel("--")
+        self.gnss_siv_label = QLabel("--")
+        self.gnss_position_label = QLabel("--")
+        self.gnss_altitude_label = QLabel("--")
+        self.gnss_accuracy_label = QLabel("--")
+        self.gnss_tow_label = QLabel("--")
+        self.gnss_pvt_label = QLabel("--")
+        self.gnss_timepulse_label = QLabel("--")
+        self.gnss_event_label = QLabel(self.gnss_last_event_text)
+        self.gnss_event_label.setWordWrap(True)
+        gnss_layout.addRow("UART ready:", self.gnss_uart_label)
+        gnss_layout.addRow("GNSS ready:", self.gnss_ready_label)
+        gnss_layout.addRow("Configured:", self.gnss_cfg_label)
+        gnss_layout.addRow("UART baud:", self.gnss_baud_label)
+        gnss_layout.addRow("Fix:", self.gnss_fix_label)
+        gnss_layout.addRow("Carrier solution:", self.gnss_carrier_label)
+        gnss_layout.addRow("Satellites:", self.gnss_siv_label)
+        gnss_layout.addRow("Position:", self.gnss_position_label)
+        gnss_layout.addRow("Altitude:", self.gnss_altitude_label)
+        gnss_layout.addRow("Accuracy:", self.gnss_accuracy_label)
+        gnss_layout.addRow("Time of week:", self.gnss_tow_label)
+        gnss_layout.addRow("PVT count:", self.gnss_pvt_label)
+        gnss_layout.addRow("Timepulse:", self.gnss_timepulse_label)
+        gnss_layout.addRow("Last GNSS event:", self.gnss_event_label)
+        layout.addWidget(gnss_box)
+
+        ntrip_state_box = QGroupBox("NTRIP State")
+        ntrip_state_layout = QFormLayout(ntrip_state_box)
+        self.ntrip_cfg_label = QLabel("--")
+        self.ntrip_enabled_label = QLabel("--")
+        self.ntrip_socket_label = QLabel("--")
+        self.ntrip_endpoint_label = QLabel("--")
+        self.ntrip_rtcm_label = QLabel("--")
+        self.ntrip_gga_label = QLabel("--")
+        self.ntrip_reconnect_label = QLabel("--")
+        self.ntrip_event_label = QLabel(self.ntrip_last_event_text)
+        self.ntrip_event_label.setWordWrap(True)
+        ntrip_state_layout.addRow("Configured:", self.ntrip_cfg_label)
+        ntrip_state_layout.addRow("Enabled:", self.ntrip_enabled_label)
+        ntrip_state_layout.addRow("Socket:", self.ntrip_socket_label)
+        ntrip_state_layout.addRow("Endpoint:", self.ntrip_endpoint_label)
+        ntrip_state_layout.addRow("RTCM bytes:", self.ntrip_rtcm_label)
+        ntrip_state_layout.addRow("GGA messages:", self.ntrip_gga_label)
+        ntrip_state_layout.addRow("Reconnects:", self.ntrip_reconnect_label)
+        ntrip_state_layout.addRow("Last NTRIP event:", self.ntrip_event_label)
+        layout.addWidget(ntrip_state_box)
+
+        self.gnss_log = QPlainTextEdit()
+        self.gnss_log.setReadOnly(True)
+        self.gnss_log.setMaximumBlockCount(2500)
+        layout.addWidget(self.gnss_log)
 
     def _refresh_ports(self):
         ports = [p.device for p in list_ports.comports()]
@@ -851,12 +1172,82 @@ class TelemetryWindow(QMainWindow):
         self.status_label.setStyleSheet("font-weight:700; color:#0a7f2e;" if ok else "font-weight:700; color:#b00020;")
         if ok:
             self._send_serial_line("SDSTATE")
+            self._send_serial_line("MODEMSTATE")
+            self._send_serial_line("MQTTSTATE")
+            self._send_serial_line("GNSSSTATE")
+            self._send_serial_line("NTRIPSTATE")
 
     def _on_serial_line(self, line: str):
+        self.serial_rx_bytes_total += len(line) + 1
+        self._update_serial_utilization(len(line) + 1)
         self.rx_queue.put(line)
 
     def _send_serial_line(self, line: str):
+        self.serial_tx_bytes_total += len(line) + 1
+        self._update_serial_utilization(len(line) + 1)
         self.serial_worker.send_line(line)
+
+    def _poll_sd_state(self):
+        if self.status_label.text().startswith("Connected:"):
+            for cmd in ("SDSTATE", "MODEMSTATE", "MQTTSTATE", "GNSSSTATE", "NTRIPSTATE"):
+                self._send_serial_line(cmd)
+
+    def _load_csv_log(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Telemetry CSV Log",
+            "",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+                lines = [line.rstrip("\r\n") for line in handle]
+        except Exception as exc:
+            QMessageBox.warning(self, "CSV load failed", f"Could not read file:\n{exc}")
+            return
+
+        if not lines:
+            self.csv_log_summary_text = f"{file_path}: empty file"
+            self.csv_log_summary_label.setText(self.csv_log_summary_text)
+            self.csv_log_preview.setPlainText("")
+            return
+
+        data_lines = [line for line in lines if line and not line.startswith("TYPE,")]
+        can1_count = sum(1 for line in data_lines if line.startswith("CAN1,"))
+        can2_count = sum(1 for line in data_lines if line.startswith("CAN2,"))
+        first_ms = None
+        last_ms = None
+        for line in data_lines:
+            parts = line.split(",", 2)
+            if len(parts) < 2:
+                continue
+            try:
+                ms = int(parts[1])
+            except ValueError:
+                continue
+            if first_ms is None:
+                first_ms = ms
+            last_ms = ms
+
+        duration_ms = 0 if (first_ms is None or last_ms is None) else max(0, last_ms - first_ms)
+        ratio_text = "n/a" if can1_count == 0 else f"{(can2_count / can1_count) * 100.0:.1f}%"
+        self.csv_log_summary_text = (
+            f"{file_path} | rows={len(data_lines)} | CAN1={can1_count} | CAN2={can2_count} "
+            f"| CAN2/CAN1={ratio_text} | duration={duration_ms} ms"
+        )
+        self.csv_log_summary_label.setText(self.csv_log_summary_text)
+
+        preview_head = data_lines[:30]
+        preview_tail = data_lines[-30:] if len(data_lines) > 30 else []
+        preview_lines = [f"Loaded: {file_path}", ""]
+        preview_lines.extend(preview_head)
+        if preview_tail:
+            preview_lines.append("...")
+            preview_lines.extend(preview_tail)
+        self.csv_log_preview.setPlainText("\n".join(preview_lines))
 
     def _send_raw_command(self):
         cmd = self.raw_cmd_input.text().strip()
@@ -871,6 +1262,46 @@ class TelemetryWindow(QMainWindow):
             return
         self._send_serial_line(f"ASMREG {text}")
 
+    def _send_modem_apn(self):
+        apn = self.apn_input.text().strip()
+        user = self.apn_user_input.text().strip()
+        password = self.apn_pass_input.text().strip()
+        self._send_serial_line(f"MODEMAPN,{apn},{user},{password}")
+
+    def _send_modem_http_test(self):
+        host = self.http_host_input.text().strip()
+        path = self.http_path_input.text().strip() or "/"
+        if not host:
+            QMessageBox.warning(self, "Missing host", "Enter an HTTP host first.")
+            return
+        self._send_serial_line(f"MODEMHTTP,{host},{path}")
+
+    def _send_mqtt_config(self):
+        host = self.mqtt_host_input.text().strip()
+        port = self.mqtt_port_input.text().strip()
+        client_id = self.mqtt_client_input.text().strip()
+        topic_prefix = self.mqtt_prefix_input.text().strip()
+        if not host or not port or not client_id or not topic_prefix:
+            QMessageBox.warning(self, "Missing MQTT config", "Host, port, client ID, and topic prefix are required.")
+            return
+        self._send_serial_line(f"MQTTCFG,{host},{port},{client_id},{topic_prefix}")
+
+    def _send_mqtt_auth(self):
+        user = self.mqtt_user_input.text().strip() or "-"
+        password = self.mqtt_pass_input.text().strip() or "-"
+        self._send_serial_line(f"MQTTAUTH,{user},{password}")
+
+    def _send_ntrip_config(self):
+        host = self.ntrip_host_input.text().strip()
+        port = self.ntrip_port_input.text().strip()
+        mount = self.ntrip_mount_input.text().strip()
+        user = self.ntrip_user_input.text().strip()
+        password = self.ntrip_pass_input.text().strip()
+        if not host or not port or not mount:
+            QMessageBox.warning(self, "Missing NTRIP config", "Host, port, and mount point are required.")
+            return
+        self._send_serial_line(f"NTRIPCFG,{host},{port},{mount},{user},{password}")
+
     def _send_can_frame(self, can_id: int, data: list[int], bus: str = "1", extended: bool = False):
         payload = " ".join(f"{b & 0xFF:02X}" for b in data)
         frame_type = "E" if extended else "S"
@@ -882,11 +1313,11 @@ class TelemetryWindow(QMainWindow):
         self.can_compare_match_count = 0
         self.can_compare_miss_count = 0
 
-    def _prune_can_compare(self, now: float):
+    def _prune_can_compare(self, now_ms: int):
         for pending_map in (self.can_compare_pending_can1, self.can_compare_pending_can2):
             empty_keys = []
             for signature, timestamps in pending_map.items():
-                while timestamps and (now - timestamps[0]) > CAN_COMPARE_TIMEOUT_S:
+                while timestamps and (now_ms - timestamps[0]) > CAN_COMPARE_TIMEOUT_MS:
                     timestamps.popleft()
                     self.can_compare_miss_count += 1
                 if not timestamps:
@@ -894,9 +1325,8 @@ class TelemetryWindow(QMainWindow):
             for signature in empty_keys:
                 pending_map.pop(signature, None)
 
-    def _track_can_compare(self, bus_name: str, can_id: int, dlc: int, payload: list[int]):
-        now = time.monotonic()
-        self._prune_can_compare(now)
+    def _track_can_compare(self, bus_name: str, can_id: int, dlc: int, payload: list[int], timestamp_ms: int):
+        self._prune_can_compare(timestamp_ms)
 
         signature = (can_id, dlc, tuple(payload[:dlc]))
         if bus_name == "CAN1":
@@ -916,7 +1346,7 @@ class TelemetryWindow(QMainWindow):
             self.can_compare_match_count += 1
             return
 
-        own_map.setdefault(signature, deque()).append(now)
+        own_map.setdefault(signature, deque()).append(timestamp_ms)
 
     def _estimate_can_frame_bits(self, extended: bool, dlc: int) -> int:
         payload_bits = max(0, min(8, dlc)) * 8
@@ -927,6 +1357,18 @@ class TelemetryWindow(QMainWindow):
         for window in (self.can_bits_window_can1, self.can_bits_window_can2):
             while window and (now - window[0][0]) > CAN_UTIL_WINDOW_S:
                 window.popleft()
+
+    def _prune_serial_window(self, now: float):
+        while self.serial_bits_window and (now - self.serial_bits_window[0][0]) > SERIAL_UTIL_WINDOW_S:
+            self.serial_bits_window.popleft()
+
+    def _update_serial_utilization(self, byte_count: int):
+        now = time.monotonic()
+        bits = max(0, byte_count) * SERIAL_BITS_PER_BYTE
+        self.serial_bits_window.append((now, bits))
+        self._prune_serial_window(now)
+        bits_total = sum(value for _, value in self.serial_bits_window)
+        self.serial_utilization = min(100.0, (bits_total / BAUD_RATE) * 100.0)
 
     def _update_can_utilization(self, bus_name: str, extended: bool, dlc: int):
         now = time.monotonic()
@@ -1008,6 +1450,14 @@ class TelemetryWindow(QMainWindow):
             self._handle_sd_line(line)
             return
 
+        if line.startswith("MODEM,") or line.startswith("MQTT,"):
+            self._handle_modem_line(line)
+            return
+
+        if line.startswith("GNSS,") or line.startswith("NTRIP,"):
+            self._handle_gnss_line(line)
+            return
+
         if line.startswith("IMU,"):
             self._handle_imu_line(line)
             return
@@ -1019,11 +1469,68 @@ class TelemetryWindow(QMainWindow):
         if line.startswith("CMD,"):
             self.asm_log.appendPlainText(line)
 
+    def _handle_modem_line(self, line: str):
+        self.modem_log.appendPlainText(line)
+        if line.startswith("MQTT,"):
+            self.mqtt_last_event_text = line
+        else:
+            self.modem_last_event_text = line
+
+        if line.startswith("MODEM,STATE,"):
+            for part in line.split(",")[2:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                self.modem_fields[key.strip()] = value.strip()
+            return
+
+        if line.startswith("MQTT,STATE,"):
+            for part in line.split(",")[2:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                self.mqtt_fields[key.strip()] = value.strip()
+
+    def _handle_gnss_line(self, line: str):
+        self.gnss_log.appendPlainText(line)
+
+        if line.startswith("GNSS,"):
+            self.gnss_last_event_text = line
+        if line.startswith("NTRIP,"):
+            self.ntrip_last_event_text = line
+
+        if line.startswith("GNSS,STATE,"):
+            for part in line.split(",")[2:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                self.gnss_fields[key.strip()] = value.strip()
+            return
+
+        if line.startswith("NTRIP,STATE,"):
+            for part in line.split(",")[2:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                self.ntrip_fields[key.strip()] = value.strip()
+
     def _handle_sd_line(self, line: str):
         self.sd_log.appendPlainText(line)
         self.sd_last_event_text = line
 
+        if line.startswith("SD,CARD,INSERTED"):
+            self.sd_fields["CARD"] = "1"
+            return
+
+        if line.startswith("SD,CARD,REMOVED"):
+            self.sd_fields["CARD"] = "0"
+            self.sd_fields["READY"] = "0"
+            self.sd_fields["ACTIVE"] = "0"
+            self.sd_fields["OPEN"] = "0"
+            return
+
         if line.startswith("SD,OK"):
+            self.sd_fields["CARD"] = "1"
             self.sd_fields["READY"] = "1"
             self.sd_fields["ERR"] = "0"
             return
@@ -1090,7 +1597,8 @@ class TelemetryWindow(QMainWindow):
             self.rx_frames_can2 += 1
 
         self._update_can_utilization(bus_name, extended, dlc)
-        self._track_can_compare(bus_name, can_id, dlc, payload)
+        self.last_can_timestamp_ms = max(self.last_can_timestamp_ms, timestamp_ms)
+        self._track_can_compare(bus_name, can_id, dlc, payload, timestamp_ms)
 
         self._decode_maxxecu(can_id, payload, timestamp_ms)
         self._decode_pdu_feedback(can_id, payload)
@@ -1227,8 +1735,11 @@ class TelemetryWindow(QMainWindow):
         bits_can2 = sum(bits for _, bits in self.can_bits_window_can2)
         self.can_utilization_can1 = min(100.0, (bits_can1 / CAN_BUS_BITRATE_BPS) * 100.0)
         self.can_utilization_can2 = min(100.0, (bits_can2 / CAN_BUS_BITRATE_BPS) * 100.0)
+        self._prune_serial_window(now)
+        serial_bits_total = sum(bits for _, bits in self.serial_bits_window)
+        self.serial_utilization = min(100.0, (serial_bits_total / BAUD_RATE) * 100.0)
 
-        self._prune_can_compare(now)
+        self._prune_can_compare(self.last_can_timestamp_ms)
         pending_total = sum(len(items) for items in self.can_compare_pending_can1.values()) + sum(
             len(items) for items in self.can_compare_pending_can2.values()
         )
@@ -1238,8 +1749,10 @@ class TelemetryWindow(QMainWindow):
         )
         self.can1_util_bar.setValue(int(self.can_utilization_can1))
         self.can2_util_bar.setValue(int(self.can_utilization_can2))
+        self.serial_util_bar.setValue(int(self.serial_utilization))
         self.can1_util_label.setText(f"{self.can_utilization_can1:.1f}%")
         self.can2_util_label.setText(f"{self.can_utilization_can2:.1f}%")
+        self.serial_util_label.setText(f"{self.serial_utilization:.1f}%")
         self.can_compare_counts_label.setText(
             f"matched: {self.can_compare_match_count}   missed: {self.can_compare_miss_count}   pending: {pending_total}"
         )
@@ -1354,15 +1867,21 @@ class TelemetryWindow(QMainWindow):
         self.asm_init_event_label.setText(self.asm_init_event_text)
 
         sd_ready = self.sd_fields.get("READY", "--")
+        sd_card = self.sd_fields.get("CARD", "--")
         sd_err = self.sd_fields.get("ERR", "--")
+        sd_read_ok = self.sd_fields.get("READ_OK", "--")
+        sd_write_ok = self.sd_fields.get("WRITE_OK", "--")
         sd_req = self.sd_fields.get("REQ", "--")
         sd_active = self.sd_fields.get("ACTIVE", "--")
         sd_open = self.sd_fields.get("OPEN", "--")
         sd_next_index = self.sd_fields.get("NEXT_INDEX", "--")
         sd_last_file = self.sd_fields.get("LAST_FILE", "--")
 
+        self.sd_card_present_label.setText(sd_card)
         self.sd_ready_label.setText(sd_ready)
         self.sd_error_label.setText(sd_err)
+        self.sd_read_ok_label.setText(sd_read_ok)
+        self.sd_write_ok_label.setText(sd_write_ok)
         self.sd_req_label.setText(sd_req)
         self.sd_active_label.setText(sd_active)
         self.sd_open_label.setText(sd_open)
@@ -1374,6 +1893,178 @@ class TelemetryWindow(QMainWindow):
         self.sd_record_state_label.setText("RECORDING" if recording_active else "IDLE")
         self.sd_record_state_label.setStyleSheet(
             "font-weight:700; color:#0a7f2e;" if recording_active else "font-weight:700; color:#666;"
+        )
+
+        healthy = sd_card == "1" and sd_ready == "1" and sd_err == "0" and sd_read_ok == "1" and sd_write_ok == "1"
+        self.sd_health_label.setText("OK" if healthy else "FAIL")
+        self.sd_health_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if healthy else "font-weight:700; color:#b00020;"
+        )
+
+        self.sd_card_present_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if sd_card == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.sd_ready_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if sd_ready == "1" else "font-weight:700; color:#b00020;"
+        )
+
+        modem_ready = self.modem_fields.get("READY", "--")
+        modem_sim = self.modem_fields.get("SIM", "--")
+        modem_net = self.modem_fields.get("NET", "--")
+        modem_gprs = self.modem_fields.get("GPRS", "--")
+        modem_internet = self.modem_fields.get("INTERNET", "--")
+        uart_ready = self.modem_fields.get("UART", "--")
+        uart_baud = self.modem_fields.get("UART_BAUD", "--")
+        uart_target = self.modem_fields.get("UART_TARGET", "--")
+        uart_probe = self.modem_fields.get("UART_PROBE", "--")
+        uart_flow = self.modem_fields.get("FLOW", "--")
+        uart_high = self.modem_fields.get("HIGH", "--")
+        self.modem_uart_label.setText(uart_ready)
+        self.modem_uart_baud_label.setText(f"{uart_baud} bps" if uart_baud not in {"--", "0"} else uart_baud)
+        self.modem_uart_target_label.setText(f"{uart_target} bps" if uart_target not in {"--", "0"} else uart_target)
+        self.modem_uart_probe_label.setText(f"{uart_probe} bps" if uart_probe not in {"--", "0"} else uart_probe)
+        self.modem_uart_flow_label.setText("RTS/CTS enabled" if uart_flow == "1" else "off" if uart_flow == "0" else uart_flow)
+        self.modem_uart_high_label.setText("active" if uart_high == "1" else "standard" if uart_high == "0" else uart_high)
+        self.modem_ready_label.setText(modem_ready)
+        self.modem_sim_label.setText(modem_sim)
+        self.modem_network_label.setText(modem_net)
+        self.modem_gprs_label.setText(modem_gprs)
+        self.modem_internet_label.setText(modem_internet)
+        self.modem_signal_label.setText(self.modem_fields.get("CSQ", "--"))
+        self.modem_http_code_label.setText(self.modem_fields.get("HTTP_CODE", "--"))
+        self.modem_apn_label.setText(self.modem_fields.get("APN", "--"))
+        self.modem_ip_label.setText(self.modem_fields.get("IP", "--"))
+        self.modem_operator_label.setText(self.modem_fields.get("OP", "--"))
+        self.modem_info_label.setText(self.modem_fields.get("INFO", "--"))
+        boot12 = self.modem_fields.get("BOOT12", "0")
+        uptime_ms_text = self.modem_fields.get("UP_MS", "0")
+        boot_timer_text = "possibly not booted modem"
+        try:
+            uptime_s = int(uptime_ms_text) / 1000.0
+            boot_timer_text = f"{'modem booted' if boot12 == '1' else 'possibly not booted modem'} ({uptime_s:.1f}s since boot)"
+        except ValueError:
+            if boot12 == "1":
+                boot_timer_text = "modem booted"
+        self.modem_boot_timer_label.setText(boot_timer_text)
+        self.modem_event_label.setText(self.modem_last_event_text)
+        self.modem_uart_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if uart_ready == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.modem_uart_high_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if uart_high == "1" else "font-weight:700; color:#8a6d00;"
+        )
+        self.modem_ready_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if modem_ready == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.modem_network_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if modem_net == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.modem_gprs_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if modem_gprs == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.modem_internet_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if modem_internet == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.modem_boot_timer_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if boot12 == "1" else "font-weight:700; color:#9a6a00;"
+        )
+
+        mqtt_cfg = self.mqtt_fields.get("CFG", "--")
+        mqtt_enabled = self.mqtt_fields.get("EN", "--")
+        mqtt_socket = self.mqtt_fields.get("SOCK", "--")
+        self.mqtt_cfg_label.setText(mqtt_cfg)
+        self.mqtt_enabled_label.setText(mqtt_enabled)
+        self.mqtt_socket_label.setText(mqtt_socket)
+        self.mqtt_endpoint_label.setText(
+            f"{self.mqtt_fields.get('HOST', '--')}:{self.mqtt_fields.get('PORT', '--')} / {self.mqtt_fields.get('CLIENT', '--')}"
+        )
+        self.mqtt_prefix_label.setText(self.mqtt_fields.get("PREFIX", "--"))
+        self.mqtt_tx_label.setText(self.mqtt_fields.get("TX", "--"))
+        self.mqtt_rx_label.setText(self.mqtt_fields.get("RX", "--"))
+        self.mqtt_reconnect_label.setText(self.mqtt_fields.get("RECONNECTS", "--"))
+        self.mqtt_dropped_label.setText(self.mqtt_fields.get("DROPPED", "--"))
+        self.mqtt_event_label.setText(self.mqtt_last_event_text)
+        self.mqtt_cfg_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if mqtt_cfg == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.mqtt_enabled_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if mqtt_enabled == "1" else "font-weight:700; color:#666;"
+        )
+        self.mqtt_socket_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if mqtt_socket == "1" else "font-weight:700; color:#b00020;"
+        )
+
+        gnss_ready = self.gnss_fields.get("READY", "--")
+        gnss_cfg = self.gnss_fields.get("CFG", "--")
+        gnss_fix_valid = self.gnss_fields.get("FIX_VALID", "--")
+        gnss_carrier = self.gnss_fields.get("CARR", "--")
+        self.gnss_uart_label.setText(self.gnss_fields.get("UART", "--"))
+        self.gnss_ready_label.setText(gnss_ready)
+        self.gnss_cfg_label.setText(gnss_cfg)
+        self.gnss_baud_label.setText(self.gnss_fields.get("UART_BAUD", "--"))
+        fix_type = self.gnss_fields.get("FIX", "--")
+        self.gnss_fix_label.setText(f"{fix_type} ({'valid' if gnss_fix_valid == '1' else 'no fix'})")
+        carrier_text = {"0": "none", "1": "RTK float", "2": "RTK fixed"}.get(gnss_carrier, gnss_carrier)
+        self.gnss_carrier_label.setText(carrier_text)
+        self.gnss_siv_label.setText(self.gnss_fields.get("SIV", "--"))
+
+        lat_text = self.gnss_fields.get("LAT_E7", "0")
+        lon_text = self.gnss_fields.get("LON_E7", "0")
+        try:
+            lat = int(lat_text) / 10_000_000.0
+            lon = int(lon_text) / 10_000_000.0
+            self.gnss_position_label.setText(f"{lat:.7f}, {lon:.7f}")
+        except ValueError:
+            self.gnss_position_label.setText("--")
+
+        alt_text = self.gnss_fields.get("ALT_MM", "0")
+        try:
+            self.gnss_altitude_label.setText(f"{int(alt_text) / 1000.0:.3f} m")
+        except ValueError:
+            self.gnss_altitude_label.setText("--")
+
+        hacc_text = self.gnss_fields.get("HACC_MM", "0")
+        vacc_text = self.gnss_fields.get("VACC_MM", "0")
+        try:
+            self.gnss_accuracy_label.setText(f"H {int(hacc_text) / 1000.0:.3f} m / V {int(vacc_text) / 1000.0:.3f} m")
+        except ValueError:
+            self.gnss_accuracy_label.setText("--")
+
+        self.gnss_tow_label.setText(self.gnss_fields.get("TOW", "--"))
+        self.gnss_pvt_label.setText(self.gnss_fields.get("PVT", "--"))
+        self.gnss_timepulse_label.setText(self.gnss_fields.get("TIMEPULSE", "--"))
+        self.gnss_event_label.setText(self.gnss_last_event_text)
+        self.gnss_ready_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if gnss_ready == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.gnss_cfg_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if gnss_cfg == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.gnss_carrier_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if gnss_carrier == "2" else "font-weight:700; color:#9a6a00;" if gnss_carrier == "1" else "font-weight:700; color:#666;"
+        )
+
+        ntrip_cfg = self.ntrip_fields.get("CFG", "--")
+        ntrip_enabled = self.ntrip_fields.get("EN", "--")
+        ntrip_socket = self.ntrip_fields.get("SOCK", "--")
+        self.ntrip_cfg_label.setText(ntrip_cfg)
+        self.ntrip_enabled_label.setText(ntrip_enabled)
+        self.ntrip_socket_label.setText(ntrip_socket)
+        self.ntrip_endpoint_label.setText(
+            f"{self.ntrip_fields.get('HOST', '--')}:{self.ntrip_fields.get('PORT', '--')} / {self.ntrip_fields.get('MOUNT', '--')}"
+        )
+        self.ntrip_rtcm_label.setText(self.ntrip_fields.get("RTCM_BYTES", "--"))
+        self.ntrip_gga_label.setText(self.ntrip_fields.get("GGA_TX", "--"))
+        self.ntrip_reconnect_label.setText(self.ntrip_fields.get("RECONNECTS", "--"))
+        self.ntrip_event_label.setText(self.ntrip_last_event_text)
+        self.ntrip_cfg_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if ntrip_cfg == "1" else "font-weight:700; color:#b00020;"
+        )
+        self.ntrip_enabled_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if ntrip_enabled == "1" else "font-weight:700; color:#666;"
+        )
+        self.ntrip_socket_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if ntrip_socket == "1" else "font-weight:700; color:#b00020;"
         )
 
     def _refresh_output_check_colors(self):

@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Telemetry Remote Panel</title>
+  <style>
+    :root {
+      --bg: #f2ece4;
+      --panel: rgba(255, 251, 247, 0.88);
+      --panel-strong: #fff9f2;
+      --ink: #1c1a18;
+      --muted: #6c6258;
+      --line: rgba(28, 26, 24, 0.12);
+      --accent: #0c8c72;
+      --accent-strong: #086b57;
+      --warn: #b25916;
+      --bad: #b02424;
+      --shadow: 0 18px 55px rgba(60, 40, 10, 0.14);
+      --radius: 24px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 15% 20%, rgba(12, 140, 114, 0.18), transparent 22%),
+        radial-gradient(circle at 85% 10%, rgba(178, 89, 22, 0.16), transparent 18%),
+        linear-gradient(145deg, #efe4d7, #f7f2eb 55%, #ece6dc);
+      padding: 24px;
+    }
+
+    .shell {
+      max-width: 1480px;
+      margin: 0 auto;
+      display: grid;
+      gap: 18px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.3fr 1fr;
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .panel {
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .hero-copy {
+      padding: 28px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 220px;
+    }
+
+    .eyebrow {
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      font-size: 0.78rem;
+      color: var(--accent-strong);
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 10px 0 12px;
+      font-size: clamp(2rem, 4vw, 4rem);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+    }
+
+    .hero-copy p {
+      max-width: 62ch;
+      color: var(--muted);
+      margin: 0;
+      line-height: 1.5;
+      font-size: 1rem;
+    }
+
+    .status-ribbon {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 18px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(12, 140, 114, 0.1);
+      color: var(--accent-strong);
+      font-weight: 700;
+      width: fit-content;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--warn);
+      box-shadow: 0 0 0 6px rgba(178, 89, 22, 0.14);
+      transition: background 0.25s ease, box-shadow 0.25s ease;
+    }
+
+    .status-dot.online {
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(12, 140, 114, 0.14);
+    }
+
+    .hero-stats {
+      padding: 24px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      align-content: center;
+    }
+
+    .metric {
+      background: rgba(255, 255, 255, 0.58);
+      border: 1px solid rgba(28, 26, 24, 0.08);
+      border-radius: 18px;
+      padding: 16px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      margin-bottom: 8px;
+    }
+
+    .metric-value {
+      font-size: 1.55rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 420px minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .stack {
+      display: grid;
+      gap: 18px;
+    }
+
+    .section {
+      padding: 22px;
+    }
+
+    .section h2 {
+      margin: 0 0 14px;
+      font-size: 1.05rem;
+      letter-spacing: -0.02em;
+    }
+
+    .field-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    input, textarea, button, select {
+      font: inherit;
+    }
+
+    input, textarea {
+      width: 100%;
+      border: 1px solid rgba(28, 26, 24, 0.14);
+      background: rgba(255, 255, 255, 0.8);
+      border-radius: 14px;
+      padding: 12px 14px;
+      color: var(--ink);
+      outline: none;
+    }
+
+    input:focus, textarea:focus {
+      border-color: rgba(12, 140, 114, 0.45);
+      box-shadow: 0 0 0 4px rgba(12, 140, 114, 0.12);
+    }
+
+    textarea {
+      min-height: 92px;
+      resize: vertical;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.2s ease, background 0.2s ease, opacity 0.2s ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      background: var(--accent-strong);
+    }
+
+    button.secondary {
+      background: rgba(28, 26, 24, 0.08);
+      color: var(--ink);
+    }
+
+    button.secondary:hover {
+      background: rgba(28, 26, 24, 0.14);
+    }
+
+    button.warn {
+      background: var(--warn);
+    }
+
+    button.warn:hover {
+      background: #92470f;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .state-card {
+      border: 1px solid rgba(28, 26, 24, 0.08);
+      background: rgba(255, 255, 255, 0.56);
+      border-radius: 20px;
+      padding: 18px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .state-card h3 {
+      margin: 0;
+      font-size: 1rem;
+      letter-spacing: -0.02em;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .pill {
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(28, 26, 24, 0.06);
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+
+    .pill.good {
+      background: rgba(12, 140, 114, 0.12);
+      color: var(--accent-strong);
+    }
+
+    .pill.bad {
+      background: rgba(176, 36, 36, 0.12);
+      color: var(--bad);
+    }
+
+    .kv {
+      display: grid;
+      gap: 8px;
+    }
+
+    .kv-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid rgba(28, 26, 24, 0.08);
+      padding-bottom: 8px;
+      font-size: 0.92rem;
+    }
+
+    .kv-row span:first-child {
+      color: var(--muted);
+    }
+
+    .log {
+      min-height: 380px;
+      max-height: 520px;
+      overflow: auto;
+      background: #17181a;
+      color: #dce8df;
+      border-radius: 18px;
+      padding: 16px;
+      font-family: "Consolas", "Courier New", monospace;
+      font-size: 0.84rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    .quick-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .footer-note {
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1100px) {
+      .hero,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .cards {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="panel hero-copy">
+        <div>
+          <div class="eyebrow">Outbound-only remote control</div>
+          <h1>4G telemetry without public IPs or port forwarding.</h1>
+          <p>
+            This panel talks to a broker over MQTT over WebSockets. The ESP32-S3 + SIM7600E talks to the same broker over
+            outbound MQTT on the cellular side. That gives you browser control, live state, and a clean path for Python tools.
+          </p>
+        </div>
+        <div class="status-ribbon">
+          <span id="statusDot" class="status-dot"></span>
+          <span id="connectionStatus">Disconnected</span>
+        </div>
+      </div>
+      <div class="panel hero-stats">
+        <div class="metric">
+          <div class="metric-label">Availability</div>
+          <div id="availabilityMetric" class="metric-value">offline</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Last command</div>
+          <div id="lastCommandMetric" class="metric-value">none</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">MQTT RX</div>
+          <div id="mqttRxMetric" class="metric-value">0</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">MQTT TX</div>
+          <div id="mqttTxMetric" class="metric-value">0</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="stack">
+        <div class="panel section">
+          <h2>Broker Session</h2>
+          <div class="field-grid">
+            <div class="field">
+              <label for="brokerUrl">Broker WebSocket URL</label>
+              <input id="brokerUrl" value="wss://9ddfaf6f481045449c7efc293f3a389f.s1.eu.hivemq.cloud:8884/mqtt" />
+            </div>
+            <div class="field">
+              <label for="topicPrefix">Topic prefix</label>
+              <input id="topicPrefix" value="szen/telemetry/node" />
+            </div>
+            <div class="field">
+              <label for="clientId">Browser client ID</label>
+              <input id="clientId" value="telemetry-browser" />
+            </div>
+            <div class="field">
+              <label for="username">Username</label>
+              <input id="username" placeholder="optional" />
+            </div>
+            <div class="field">
+              <label for="password">Password</label>
+              <input id="password" type="password" placeholder="optional" />
+            </div>
+          </div>
+          <div class="actions">
+            <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn" class="secondary">Disconnect</button>
+            <button id="refreshStateBtn" class="secondary">Refresh device state</button>
+          </div>
+        </div>
+
+        <div class="panel section">
+          <h2>Command Console</h2>
+          <div class="quick-actions">
+            <button data-cmd="MODEMSTATE">MODEMSTATE</button>
+            <button data-cmd="MQTTSTATE">MQTTSTATE</button>
+            <button data-cmd="GNSSSTATE">GNSSSTATE</button>
+            <button data-cmd="NTRIPSTATE">NTRIPSTATE</button>
+            <button data-cmd="MODEMCONNECT">MODEMCONNECT</button>
+            <button data-cmd="MODEMDISCONNECT" class="secondary">MODEMDISCONNECT</button>
+            <button data-cmd="MQTTON">MQTTON</button>
+            <button data-cmd="MQTTOFF" class="warn">MQTTOFF</button>
+          </div>
+          <div class="field" style="margin-top: 14px;">
+            <label for="commandInput">Raw command payload</label>
+            <textarea id="commandInput" placeholder="Example: TX,1,S,200,2,A5 01"></textarea>
+          </div>
+          <div class="actions">
+            <button id="sendCommandBtn">Publish command</button>
+            <button id="clearLogBtn" class="secondary">Clear log</button>
+          </div>
+          <p class="footer-note">
+            Commands are published as the same line protocol already used over USB. The firmware reuses the same parser on the MQTT side.
+          </p>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="cards">
+          <div class="panel state-card">
+            <h3>Modem</h3>
+            <div id="modemPills" class="pill-row"></div>
+            <div id="modemKv" class="kv"></div>
+          </div>
+          <div class="panel state-card">
+            <h3>MQTT Link</h3>
+            <div id="mqttPills" class="pill-row"></div>
+            <div id="mqttKv" class="kv"></div>
+          </div>
+          <div class="panel state-card">
+            <h3>GNSS</h3>
+            <div id="gnssPills" class="pill-row"></div>
+            <div id="gnssKv" class="kv"></div>
+          </div>
+          <div class="panel state-card">
+            <h3>NTRIP</h3>
+            <div id="ntripPills" class="pill-row"></div>
+            <div id="ntripKv" class="kv"></div>
+          </div>
+        </div>
+
+        <div class="panel section">
+          <h2>Broker Log</h2>
+          <div id="log" class="log">Waiting for connection...</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script>
+    const state = {
+      client: null,
+      prefix: "",
+      availability: "offline",
+      modem: {},
+      mqtt: {},
+      gnss: {},
+      ntrip: {},
+      lastCommand: "none",
+    };
+
+    const dom = {
+      brokerUrl: document.getElementById("brokerUrl"),
+      topicPrefix: document.getElementById("topicPrefix"),
+      clientId: document.getElementById("clientId"),
+      username: document.getElementById("username"),
+      password: document.getElementById("password"),
+      connectBtn: document.getElementById("connectBtn"),
+      disconnectBtn: document.getElementById("disconnectBtn"),
+      refreshStateBtn: document.getElementById("refreshStateBtn"),
+      sendCommandBtn: document.getElementById("sendCommandBtn"),
+      clearLogBtn: document.getElementById("clearLogBtn"),
+      commandInput: document.getElementById("commandInput"),
+      connectionStatus: document.getElementById("connectionStatus"),
+      statusDot: document.getElementById("statusDot"),
+      availabilityMetric: document.getElementById("availabilityMetric"),
+      lastCommandMetric: document.getElementById("lastCommandMetric"),
+      mqttRxMetric: document.getElementById("mqttRxMetric"),
+      mqttTxMetric: document.getElementById("mqttTxMetric"),
+      log: document.getElementById("log"),
+      modemPills: document.getElementById("modemPills"),
+      mqttPills: document.getElementById("mqttPills"),
+      gnssPills: document.getElementById("gnssPills"),
+      ntripPills: document.getElementById("ntripPills"),
+      modemKv: document.getElementById("modemKv"),
+      mqttKv: document.getElementById("mqttKv"),
+      gnssKv: document.getElementById("gnssKv"),
+      ntripKv: document.getElementById("ntripKv"),
+    };
+
+    function logLine(text) {
+      const stamp = new Date().toLocaleTimeString();
+      dom.log.textContent += `\n[${stamp}] ${text}`;
+      dom.log.scrollTop = dom.log.scrollHeight;
+    }
+
+    function setConnected(connected, text) {
+      dom.connectionStatus.textContent = text;
+      dom.statusDot.classList.toggle("online", connected);
+    }
+
+    function parseCsvState(line) {
+      const out = {};
+      const parts = line.split(",");
+      for (const part of parts.slice(2)) {
+        const pivot = part.indexOf("=");
+        if (pivot === -1) {
+          continue;
+        }
+        out[part.slice(0, pivot).trim()] = part.slice(pivot + 1).trim();
+      }
+      return out;
+    }
+
+    function makePill(label, good) {
+      const span = document.createElement("span");
+      span.className = `pill ${good === true ? "good" : good === false ? "bad" : ""}`;
+      span.textContent = label;
+      return span;
+    }
+
+    function renderPills(target, items) {
+      target.replaceChildren(...items);
+    }
+
+    function renderKv(target, pairs) {
+      target.replaceChildren(...pairs.map(([k, v]) => {
+        const row = document.createElement("div");
+        row.className = "kv-row";
+        const key = document.createElement("span");
+        key.textContent = k;
+        const value = document.createElement("strong");
+        value.textContent = v ?? "--";
+        row.append(key, value);
+        return row;
+      }));
+    }
+
+    function updateUi() {
+      dom.availabilityMetric.textContent = state.availability;
+      dom.lastCommandMetric.textContent = state.lastCommand;
+      dom.mqttRxMetric.textContent = state.mqtt.RX || "0";
+      dom.mqttTxMetric.textContent = state.mqtt.TX || "0";
+
+      renderPills(dom.modemPills, [
+        makePill(`ready ${state.modem.READY || "--"}`, state.modem.READY === "1"),
+        makePill(`net ${state.modem.NET || "--"}`, state.modem.NET === "1"),
+        makePill(`gprs ${state.modem.GPRS || "--"}`, state.modem.GPRS === "1"),
+        makePill(`internet ${state.modem.INTERNET || "--"}`, state.modem.INTERNET === "1"),
+      ]);
+      renderKv(dom.modemKv, [
+        ["Operator", state.modem.OP],
+        ["IP", state.modem.IP],
+        ["Signal", state.modem.CSQ],
+        ["Event", state.modem.EVENT],
+        ["Error", state.modem.ERR],
+      ]);
+
+      renderPills(dom.mqttPills, [
+        makePill(`configured ${state.mqtt.CFG || "--"}`, state.mqtt.CFG === "1"),
+        makePill(`enabled ${state.mqtt.EN || "--"}`, state.mqtt.EN === "1"),
+        makePill(`socket ${state.mqtt.SOCK || "--"}`, state.mqtt.SOCK === "1"),
+      ]);
+      renderKv(dom.mqttKv, [
+        ["Host", state.mqtt.HOST],
+        ["Port", state.mqtt.PORT],
+        ["Client", state.mqtt.CLIENT],
+        ["Prefix", state.mqtt.PREFIX],
+        ["Reconnects", state.mqtt.RECONNECTS],
+        ["Event", state.mqtt.EVENT],
+        ["Error", state.mqtt.ERR],
+      ]);
+
+      renderPills(dom.gnssPills, [
+        makePill(`ready ${state.gnss.READY || "--"}`, state.gnss.READY === "1"),
+        makePill(`configured ${state.gnss.CFG || "--"}`, state.gnss.CFG === "1"),
+        makePill(`fix ${state.gnss.FIX_VALID || "--"}`, state.gnss.FIX_VALID === "1"),
+      ]);
+      renderKv(dom.gnssKv, [
+        ["Fix type", state.gnss.FIX],
+        ["Carrier", state.gnss.CARR],
+        ["Satellites", state.gnss.SIV],
+        ["Latitude", state.gnss.LAT_E7],
+        ["Longitude", state.gnss.LON_E7],
+        ["Event", state.gnss.EVENT],
+      ]);
+
+      renderPills(dom.ntripPills, [
+        makePill(`configured ${state.ntrip.CFG || "--"}`, state.ntrip.CFG === "1"),
+        makePill(`enabled ${state.ntrip.EN || "--"}`, state.ntrip.EN === "1"),
+        makePill(`socket ${state.ntrip.SOCK || "--"}`, state.ntrip.SOCK === "1"),
+      ]);
+      renderKv(dom.ntripKv, [
+        ["Host", state.ntrip.HOST],
+        ["Port", state.ntrip.PORT],
+        ["Mount", state.ntrip.MOUNT],
+        ["RTCM bytes", state.ntrip.RTCM_BYTES],
+        ["Reconnects", state.ntrip.RECONNECTS],
+        ["Event", state.ntrip.EVENT],
+      ]);
+    }
+
+    function subscribeTopics() {
+      const prefix = state.prefix;
+      state.client.subscribe(`${prefix}/availability`);
+      state.client.subscribe(`${prefix}/state/+`);
+      state.client.subscribe(`${prefix}/event/+`);
+    }
+
+    function handleMessage(topic, payload) {
+      const text = payload.toString();
+      logLine(`${topic} <= ${text}`);
+
+      if (topic.endsWith("/availability")) {
+        state.availability = text;
+        updateUi();
+        return;
+      }
+
+      if (topic.endsWith("/state/modem")) {
+        state.modem = parseCsvState(text);
+      } else if (topic.endsWith("/state/mqtt")) {
+        state.mqtt = parseCsvState(text);
+      } else if (topic.endsWith("/state/gnss")) {
+        state.gnss = parseCsvState(text);
+      } else if (topic.endsWith("/state/ntrip")) {
+        state.ntrip = parseCsvState(text);
+      }
+
+      updateUi();
+    }
+
+    function connectBroker() {
+      const url = dom.brokerUrl.value.trim();
+      const prefix = dom.topicPrefix.value.trim();
+      const clientId = dom.clientId.value.trim() || `telemetry-browser-${Math.floor(Math.random() * 1000)}`;
+      if (!url || !prefix) {
+        alert("Broker WebSocket URL and topic prefix are required.");
+        return;
+      }
+
+      state.prefix = prefix;
+      if (state.client) {
+        state.client.end(true);
+      }
+
+      state.client = mqtt.connect(url, {
+        clientId,
+        username: dom.username.value.trim() || undefined,
+        password: dom.password.value || undefined,
+        reconnectPeriod: 2500,
+        clean: false,
+      });
+
+      setConnected(false, "Connecting...");
+      logLine(`connecting to ${url}`);
+
+      state.client.on("connect", () => {
+        setConnected(true, `Connected as ${clientId}`);
+        subscribeTopics();
+        logLine("broker connected");
+      });
+
+      state.client.on("reconnect", () => {
+        setConnected(false, "Reconnecting...");
+        logLine("reconnecting");
+      });
+
+      state.client.on("close", () => {
+        setConnected(false, "Disconnected");
+        logLine("broker disconnected");
+      });
+
+      state.client.on("error", (err) => {
+        setConnected(false, `Error: ${err.message}`);
+        logLine(`error: ${err.message}`);
+      });
+
+      state.client.on("message", (topic, payload) => handleMessage(topic, payload));
+    }
+
+    function publishCommand(command) {
+      const text = command.trim();
+      if (!state.client || !state.client.connected) {
+        alert("Connect to the broker first.");
+        return;
+      }
+      if (!text) {
+        return;
+      }
+      const topic = `${state.prefix}/control/command`;
+      state.client.publish(topic, text, { qos: 1 });
+      state.lastCommand = text;
+      updateUi();
+      logLine(`${topic} => ${text}`);
+    }
+
+    dom.connectBtn.addEventListener("click", connectBroker);
+    dom.disconnectBtn.addEventListener("click", () => {
+      if (state.client) {
+        state.client.end(true);
+      }
+    });
+    dom.refreshStateBtn.addEventListener("click", () => {
+      ["MODEMSTATE", "MQTTSTATE", "GNSSSTATE", "NTRIPSTATE"].forEach(publishCommand);
+    });
+    dom.sendCommandBtn.addEventListener("click", () => publishCommand(dom.commandInput.value));
+    dom.clearLogBtn.addEventListener("click", () => {
+      dom.log.textContent = "Log cleared.";
+    });
+
+    document.querySelectorAll("[data-cmd]").forEach((button) => {
+      button.addEventListener("click", () => publishCommand(button.dataset.cmd));
+    });
+
+    updateUi();
+  </script>
+</body>
+</html>

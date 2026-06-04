@@ -11,13 +11,24 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <math.h>
+#include <stdarg.h>
+
+#include <driver/uart.h>
+
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+
+#include <MQTT.h>
+#include <mcp_can.h>
+#include <TinyGsmClient.h>
+#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 
 namespace {
 
 constexpr uint32_t kSerialBaud = 921600;
 constexpr uint32_t kHeartbeatHalfPeriodMs = 25;
 constexpr uint32_t kSdErrorHalfPeriodMs = 250;
-constexpr uint32_t kAsm330DebugPeriodMs = 100;
+constexpr uint32_t kAsm330DebugPeriodMs = 1000;
 constexpr uint32_t kAsm330RetryPeriodMs = 250;
 constexpr uint32_t kTwaiStatusPeriodMs = 1000;
 constexpr uint32_t kAsm330StartupRetries = 20;
@@ -36,23 +47,70 @@ constexpr int kAsm330Sa0Pin = 7;
 constexpr int kAsm330SclPin = 8;
 constexpr int kAsm330DrdyPin = 45;
 constexpr int kAsm330CsPin = 35;  // bodge wire: was GND, now IO35
-constexpr bool kAsm330Sa0High = true;
-constexpr uint32_t kAsm330I2cHz = 400000;
-constexpr bool kEnableAsm330Runtime = false;
+constexpr bool kAsm330Sa0High = false;
+constexpr uint32_t kAsm330I2cHz = 100000;
+constexpr bool kEnableAsm330Runtime = true;
 
 constexpr int kSdCsPin = 9;
 constexpr int kMcp2515CsPin = 10;
 constexpr int kMcp2515MosiPin = 11;
 constexpr int kMcp2515SckPin = 12;
 constexpr int kMcp2515MisoPin = 13;
+constexpr int kMcp2515IntPin = 3;
+constexpr int kGnssEspRxPin = 14;
+constexpr int kModemCtsPin = 15;
+constexpr int kModemRtsPin = 16;
+constexpr int kModemEspTxPin = 17;
+constexpr int kModemEspRxPin = 18;
+constexpr int kModemResetPin = 1;
+constexpr int kModemPwrKeyPin = 2;
+constexpr int kGnssEspTxPin = 21;
+constexpr int kGnssTimePulsePin = 47;
+constexpr int kGnssResetPin = 48;
 constexpr uint32_t kMcp2515SpiHz = 4000000;
 constexpr uint32_t kMcp2515StatusPeriodMs = 1000;
 constexpr bool kMcp2515EnableClockRecovery = false;
 constexpr uint32_t kMcpServiceTaskStack = 4096;
-constexpr UBaseType_t kMcpServiceTaskPriority = 3;
+constexpr UBaseType_t kMcpServiceTaskPriority = 1;
 constexpr BaseType_t kMcpServiceTaskCore = 0;
-constexpr size_t kMcpRxQueueDepth = 256;
+constexpr size_t kMcpRxQueueDepth = 1024;
 constexpr uint32_t kMcpErrorReportPeriodMs = 250;
+constexpr uint32_t kTwaiRxBudgetPerLoop = 64;
+constexpr uint32_t kMcpQueueDrainBudgetPerLoop = 128;
+constexpr uint32_t kSdHealthCheckPeriodMs = 5000;
+constexpr size_t kSdLogQueueDepth = 512;
+constexpr uint32_t kSdLogWriteBudgetPerLoop = 16;
+constexpr uint32_t kGnssTargetUartBaud = 921600;
+constexpr uint32_t kGnssUartBaudCandidates[] = {kGnssTargetUartBaud, 460800, 115200, 38400, 9600};
+constexpr uint32_t kGnssNavigationFrequencyHz = 2;
+constexpr uint32_t kGnssReportPeriodMs = 1000;
+constexpr uint32_t kGnssTaskStack = 6144;
+constexpr UBaseType_t kGnssTaskPriority = 1;
+constexpr BaseType_t kGnssTaskCore = 1;
+constexpr uint32_t kModemStandardUartBaud = 115200;
+constexpr uint32_t kModemTargetUartBaud = 921600;
+constexpr uint32_t kModemUartBaudCandidates[] = {kModemStandardUartBaud, kModemTargetUartBaud, 460800};
+constexpr uint32_t kModemPowerKeyAssertMs = 500;
+constexpr uint32_t kModemPowerKeyBootWaitMs = 12000;
+constexpr uint32_t kModemPowerKeyBootMaxMs = 16000;
+constexpr uint32_t kModemAtProbeTimeoutMs = 750;
+constexpr uint32_t kModemReadyProbePeriodMs = 2000;
+constexpr uint32_t kModemSnapshotPeriodMs = 1000;
+constexpr uint32_t kModemRecoveryRetryMs = 1500;
+constexpr uint32_t kModemReportPeriodMs = 1500;
+constexpr uint32_t kModemTaskStack = 8192;
+constexpr UBaseType_t kModemTaskPriority = 1;
+constexpr BaseType_t kModemTaskCore = 0;
+constexpr uint32_t kMqttReconnectPeriodMs = 5000;
+constexpr uint32_t kMqttPublishPeriodMs = 2000;
+constexpr uint16_t kMqttDefaultPort = 8883;
+constexpr size_t kMqttTopicBufferSize = 128;
+constexpr size_t kMqttPayloadBufferSize = 320;
+constexpr size_t kMqttClientBufferSize = 512;
+constexpr uint32_t kNtripReconnectPeriodMs = 5000;
+constexpr uint32_t kNtripIdleTimeoutMs = 15000;
+constexpr uint32_t kNtripGgaPeriodMs = 10000;
+constexpr size_t kSerialCommandBufferSize = 192;
 
 constexpr uint32_t kRecordButtonDebounceMs = 35;
 
@@ -111,6 +169,91 @@ struct can_frame {
 struct QueuedCanFrame {
   can_frame frame = {};
   uint32_t timestampMs = 0;
+};
+
+struct SdLogEntry {
+  char text[96] = {};
+};
+
+struct GnssState {
+  bool uartReady = false;
+  bool moduleReady = false;
+  bool configured = false;
+  bool fixValid = false;
+  bool invalidLlh = true;
+  bool timePulseHigh = false;
+  uint32_t uartBaud = 0;
+  uint8_t fixType = 0;
+  uint8_t carrierSolution = 0;
+  uint8_t siv = 0;
+  int32_t latitudeE7 = 0;
+  int32_t longitudeE7 = 0;
+  int32_t altitudeMslMm = 0;
+  int32_t horizontalAccuracyMm = 0;
+  int32_t verticalAccuracyMm = 0;
+  uint32_t timeOfWeekMs = 0;
+  uint32_t pvtCount = 0;
+  uint32_t lastPvtMillis = 0;
+  char lastEvent[48] = "BOOT";
+  char lastError[64] = "-";
+};
+
+struct CellularState {
+  bool uartReady = false;
+  bool modemReady = false;
+  bool simReady = false;
+  bool networkReady = false;
+  bool gprsReady = false;
+  bool internetOk = false;
+  bool mqttConfigured = false;
+  bool mqttEnabled = false;
+  bool mqttConnected = false;
+  bool ntripConfigured = false;
+  bool ntripEnabled = false;
+  bool ntripConnected = false;
+  bool uartHardwareFlow = true;
+  bool uartHighSpeedActive = false;
+  int signalQuality = -1;
+  uint16_t mqttPort = kMqttDefaultPort;
+  uint16_t ntripPort = 2101;
+  uint32_t uartBaud = kModemStandardUartBaud;
+  uint32_t uartTargetBaud = kModemTargetUartBaud;
+  uint32_t uartLastProbeBaud = 0;
+  uint32_t lastNetworkMillis = 0;
+  uint32_t lastHttpTestMillis = 0;
+  uint32_t lastMqttRxMillis = 0;
+  uint32_t lastMqttTxMillis = 0;
+  uint32_t httpStatusCode = 0;
+  uint32_t mqttPublishCount = 0;
+  uint32_t mqttReceiveCount = 0;
+  uint32_t mqttReconnectCount = 0;
+  uint32_t ntripBytesRx = 0;
+  uint32_t ntripGgaTxCount = 0;
+  uint32_t ntripReconnectCount = 0;
+  uint32_t lastNtripDataMillis = 0;
+  char modemInfo[48] = "-";
+  char operatorName[32] = "-";
+  char ipAddress[24] = "-";
+  char apn[40] = "";
+  char apnUser[32] = "";
+  char apnPass[32] = "";
+  char httpHost[48] = "example.com";
+  char httpPath[64] = "/";
+  char mqttHost[64] = "9ddfaf6f481045449c7efc293f3a389f.s1.eu.hivemq.cloud";
+  char mqttClientId[48] = "telemetry-node";
+  char mqttUser[32] = "";
+  char mqttPass[32] = "";
+  char mqttTopicPrefix[64] = "szen/telemetry/node";
+  char ntripHost[48] = "";
+  char ntripMount[32] = "";
+  char ntripUser[32] = "";
+  char ntripPass[32] = "";
+  char lastModemEvent[48] = "BOOT";
+  char lastModemError[64] = "-";
+  char lastMqttEvent[48] = "IDLE";
+  char lastMqttError[64] = "-";
+  char lastNtripEvent[48] = "IDLE";
+  char lastNtripError[64] = "-";
 };
 
 struct Mcp2515BitTimingProfile {
@@ -534,10 +677,24 @@ ASM330LHHSensor asm330SensorHigh(&imuI2c, kAsm330DriverAddressHigh);
 ASM330LHHSensor asm330SensorLow(&imuI2c, kAsm330DriverAddressLow);
 ASM330LHHSensor *g_asm330Sensor = &asm330SensorHigh;
 SPIClass canSpi(HSPI);
-Mcp2515Driver mcp2515(kMcp2515CsPin, kMcp2515SpiHz, &canSpi);
+HardwareSerial gnssSerial(1);
+HardwareSerial modemSerial(2);
+MCP_CAN mcp2515(&canSpi, kMcp2515CsPin);
+SFE_UBLOX_GNSS g_gnss;
+TinyGsm g_modem(modemSerial);
+TinyGsmClient g_httpClient(g_modem);
+TinyGsmClient g_mqttTransport(g_modem);
+TinyGsmClient g_ntripClient(g_modem);
+MQTTClient g_mqttClient(kMqttClientBufferSize, kMqttClientBufferSize);
 SemaphoreHandle_t g_canSpiMutex = nullptr;
+SemaphoreHandle_t g_gnssStateMutex = nullptr;
+SemaphoreHandle_t g_cellularStateMutex = nullptr;
+SemaphoreHandle_t g_gnssUartMutex = nullptr;
 TaskHandle_t g_mcpServiceTaskHandle = nullptr;
+TaskHandle_t g_gnssTaskHandle = nullptr;
+TaskHandle_t g_modemTaskHandle = nullptr;
 QueueHandle_t g_mcpRxQueue = nullptr;
+QueueHandle_t g_sdLogQueue = nullptr;
 
 volatile bool g_imuDataReady = false;
 bool g_twaiReady = false;
@@ -563,12 +720,16 @@ uint32_t g_buttonLastTransitionMs = 0;
 uint16_t g_logFileIndex = 0;
 uint32_t g_lastAsm330DebugMs = 0;
 uint32_t g_lastTwaiStatusMs = 0;
+uint32_t g_lastSdHealthCheckMs = 0;
 uint32_t g_logLineCount = 0;
+uint32_t g_lastGnssReportMs = 0;
+uint32_t g_lastModemReportMs = 0;
 uint32_t g_twaiRxFrameCount = 0;
 volatile uint32_t g_mcpRxFrameCount = 0;
 volatile uint32_t g_mcpRxOverrunCount = 0;
 volatile uint32_t g_mcpRxReadErrorCount = 0;
 volatile uint32_t g_mcpQueueDropCount = 0;
+volatile uint8_t g_mcpLastErrorFlags = 0;
 volatile uint8_t g_mcpLastOverrunEflg = 0;
 volatile uint8_t g_mcpLastReadErrEflg = 0;
 volatile uint8_t g_mcpLastReadErrCanintf = 0;
@@ -600,12 +761,63 @@ uint8_t g_asm330LastCtrl4C = 0;
 uint8_t g_asm330LastCtrl9Xl = 0;
 uint8_t g_asm330LastInt1Ctrl = 0;
 uint8_t g_asm330I2cAddress = kAsm330I2cAddressHigh;
-char g_serialCommandBuffer[64] = {};
+char g_serialCommandBuffer[kSerialCommandBufferSize] = {};
 size_t g_serialCommandLength = 0;
 bool g_asm330InitRetryEnabled = false;
 bool g_asm330LastInitSucceeded = false;
+bool g_sdCardPresent = false;
+bool g_sdReadOk = false;
+bool g_sdWriteOk = false;
+uint32_t g_sdLogEnqueueDropCount = 0;
+volatile bool g_modemConnectRequested = false;
+volatile bool g_modemDisconnectRequested = false;
+volatile bool g_modemPowerKeyRequested = false;
+volatile bool g_modemResetRequested = false;
+volatile bool g_modemHttpTestRequested = false;
+volatile bool g_mqttEnableRequested = false;
+volatile bool g_mqttDisableRequested = false;
+volatile bool g_mqttPublishStateRequested = false;
+volatile bool g_gnssResetRequested = false;
+volatile bool g_ntripEnableRequested = false;
+volatile bool g_ntripDisableRequested = false;
+char g_pendingMqttCommand[kSerialCommandBufferSize] = {};
+bool g_pendingMqttCommandReady = false;
+uint32_t g_lastModemSnapshotMs = 0;
+uint32_t g_lastModemReadyProbeMs = 0;
+uint32_t g_lastModemRecoveryAttemptMs = 0;
+uint32_t g_lastModemPowerKeyPulseMs = 0;
+uint8_t g_modemAtFailureCount = 0;
+bool g_modemInitialized = false;
+bool g_modemHighSpeedConfigured = false;
+bool g_modemPowerKeyBootPending = false;
+
+GnssState g_gnssState = {};
+CellularState g_cellularState = {};
 
 File g_logFile;
+
+bool takeMutex(SemaphoreHandle_t mutex, const TickType_t waitTicks = portMAX_DELAY) {
+  return mutex == nullptr || xSemaphoreTake(mutex, waitTicks) == pdTRUE;
+}
+
+void giveMutex(SemaphoreHandle_t mutex) {
+  if (mutex != nullptr) {
+    xSemaphoreGive(mutex);
+  }
+}
+
+bool takeMcpBus() {
+  if (g_canSpiMutex != nullptr && xSemaphoreTake(g_canSpiMutex, portMAX_DELAY) != pdTRUE) {
+    return false;
+  }
+
+  digitalWrite(kSdCsPin, HIGH);
+  return true;
+}
+
+void giveMcpBus() {
+  giveCanSpiMutex();
+}
 
 bool takeCanSpiMutex() {
   return g_canSpiMutex == nullptr || xSemaphoreTake(g_canSpiMutex, portMAX_DELAY) == pdTRUE;
@@ -629,10 +841,22 @@ struct ImuSample {
 };
 
 void asm330ReadRegisters(uint8_t startReg, uint8_t *buffer, size_t length);
+void prepareAsm330I2cPins();
+void printAsm330I2cScan(const char *prefix);
 
 void IRAM_ATTR onAsm330DataReady() {
   g_imuDataReady = true;
   g_asm330IrqCount++;
+}
+
+void IRAM_ATTR onMcp2515Interrupt() {
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  if (g_mcpServiceTaskHandle != nullptr) {
+    vTaskNotifyGiveFromISR(g_mcpServiceTaskHandle, &higherPriorityTaskWoken);
+  }
+  if (higherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
 }
 
 void printHexByte(const uint8_t value) {
@@ -652,20 +876,173 @@ void setLed(const int pin, const bool on) {
   digitalWrite(pin, on ? LOW : HIGH);
 }
 
+void copyText(char *destination, const size_t destinationSize, const char *source) {
+  if (destination == nullptr || destinationSize == 0U) {
+    return;
+  }
+
+  const char *resolved = (source != nullptr && source[0] != '\0') ? source : "-";
+  strncpy(destination, resolved, destinationSize - 1U);
+  destination[destinationSize - 1U] = '\0';
+}
+
+void sanitizeText(const char *source, char *destination, const size_t destinationSize) {
+  if (destination == nullptr || destinationSize == 0U) {
+    return;
+  }
+
+  if (source == nullptr || source[0] == '\0') {
+    copyText(destination, destinationSize, "-");
+    return;
+  }
+
+  size_t outIndex = 0;
+  for (size_t inIndex = 0; source[inIndex] != '\0' && outIndex + 1U < destinationSize; ++inIndex) {
+    const char ch = source[inIndex];
+    if (ch == ',' || ch == '\r' || ch == '\n' || !isprint(static_cast<unsigned char>(ch))) {
+      destination[outIndex++] = '_';
+    } else if (isspace(static_cast<unsigned char>(ch))) {
+      destination[outIndex++] = '_';
+    } else {
+      destination[outIndex++] = ch;
+    }
+  }
+
+  if (outIndex == 0U) {
+    destination[outIndex++] = '-';
+  }
+  destination[outIndex] = '\0';
+}
+
+void sanitizeString(const String &source, char *destination, const size_t destinationSize) {
+  sanitizeText(source.c_str(), destination, destinationSize);
+}
+
+GnssState copyGnssState() {
+  GnssState snapshot = {};
+  if (takeMutex(g_gnssStateMutex, pdMS_TO_TICKS(10))) {
+    snapshot = g_gnssState;
+    giveMutex(g_gnssStateMutex);
+  }
+  return snapshot;
+}
+
+CellularState copyCellularState() {
+  CellularState snapshot = {};
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    snapshot = g_cellularState;
+    giveMutex(g_cellularStateMutex);
+  }
+  return snapshot;
+}
+
+void setGnssEvent(const char *eventText, const char *errorText = nullptr) {
+  if (!takeMutex(g_gnssStateMutex, pdMS_TO_TICKS(10))) {
+    return;
+  }
+
+  copyText(g_gnssState.lastEvent, sizeof(g_gnssState.lastEvent), eventText);
+  if (errorText != nullptr) {
+    copyText(g_gnssState.lastError, sizeof(g_gnssState.lastError), errorText);
+  }
+  giveMutex(g_gnssStateMutex);
+}
+
+void setModemEvent(const char *eventText, const char *errorText = nullptr) {
+  if (!takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    return;
+  }
+
+  copyText(g_cellularState.lastModemEvent, sizeof(g_cellularState.lastModemEvent), eventText);
+  if (errorText != nullptr) {
+    copyText(g_cellularState.lastModemError, sizeof(g_cellularState.lastModemError), errorText);
+  }
+  giveMutex(g_cellularStateMutex);
+}
+
+void setMqttEvent(const char *eventText, const char *errorText = nullptr) {
+  if (!takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    return;
+  }
+
+  copyText(g_cellularState.lastMqttEvent, sizeof(g_cellularState.lastMqttEvent), eventText);
+  if (errorText != nullptr) {
+    copyText(g_cellularState.lastMqttError, sizeof(g_cellularState.lastMqttError), errorText);
+  }
+  giveMutex(g_cellularStateMutex);
+}
+
+void setNtripEvent(const char *eventText, const char *errorText = nullptr) {
+  if (!takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    return;
+  }
+
+  copyText(g_cellularState.lastNtripEvent, sizeof(g_cellularState.lastNtripEvent), eventText);
+  if (errorText != nullptr) {
+    copyText(g_cellularState.lastNtripError, sizeof(g_cellularState.lastNtripError), errorText);
+  }
+  giveMutex(g_cellularStateMutex);
+}
+
+void clearSdLogQueue() {
+  if (g_sdLogQueue == nullptr) {
+    return;
+  }
+
+  SdLogEntry entry = {};
+  while (xQueueReceive(g_sdLogQueue, &entry, 0) == pdTRUE) {
+  }
+}
+
+bool runSdQuickProbe() {
+  bool readOk = false;
+  bool writeOk = false;
+  if (!takeCanSpiMutex()) {
+    return false;
+  }
+
+  // Keep MCP2515 deselected while probing SD on shared HSPI.
+  digitalWrite(kMcp2515CsPin, HIGH);
+
+  File root = SD.open("/");
+  if (root) {
+    readOk = root.isDirectory();
+    root.close();
+  }
+
+  if (readOk) {
+    File probe = SD.open("/.SDCHK", FILE_WRITE);
+    if (probe) {
+      writeOk = true;
+      probe.close();
+    }
+  }
+
+  giveCanSpiMutex();
+
+  g_sdReadOk = readOk;
+  g_sdWriteOk = writeOk;
+  return readOk && writeOk;
+}
+
 bool isRecordingActive() {
   return g_recordingRequested && g_sdReady && !g_sdError && static_cast<bool>(g_logFile);
 }
 
 void printSdState(const char *prefix) {
   Serial.printf(
-      "%s,READY=%u,ERR=%u,REQ=%u,ACTIVE=%u,OPEN=%u,NEXT_INDEX=%u\n",
+    "%s,CARD=%u,READY=%u,ERR=%u,READ_OK=%u,WRITE_OK=%u,REQ=%u,ACTIVE=%u,OPEN=%u,NEXT_INDEX=%u,LOGQ_DROP=%lu\n",
       prefix,
+    g_sdCardPresent ? 1U : 0U,
       g_sdReady ? 1U : 0U,
       g_sdError ? 1U : 0U,
+    g_sdReadOk ? 1U : 0U,
+    g_sdWriteOk ? 1U : 0U,
       g_recordingRequested ? 1U : 0U,
       isRecordingActive() ? 1U : 0U,
       static_cast<bool>(g_logFile) ? 1U : 0U,
-      static_cast<unsigned int>(g_logFileIndex));
+    static_cast<unsigned int>(g_logFileIndex),
+    static_cast<unsigned long>(g_sdLogEnqueueDropCount));
 }
 
 bool openLogFile() {
@@ -692,6 +1069,7 @@ bool openLogFile() {
       if (g_logFile) {
         g_logFileIndex = idx + 1;
         g_logLineCount = 0;
+        clearSdLogQueue();
         g_logFile.println("TYPE,MS,IDTYPE,ID,DLC,DATA");
         g_logFile.flush();
         Serial.printf("SD,LOG_OPEN,%s\n", fileName);
@@ -720,6 +1098,7 @@ void closeLogFile() {
     }
     Serial.println("SD,LOG_CLOSED");
   }
+  clearSdLogQueue();
 }
 
 bool logLine(const String &line) {
@@ -727,31 +1106,1264 @@ bool logLine(const String &line) {
     return false;
   }
 
+  if (g_sdLogQueue == nullptr) {
+    return false;
+  }
+
+  SdLogEntry entry = {};
+  line.toCharArray(entry.text, sizeof(entry.text));
+  if (xQueueSend(g_sdLogQueue, &entry, 0) != pdPASS) {
+    g_sdLogEnqueueDropCount++;
+    return false;
+  }
+
+  return true;
+}
+
+void serviceSdLogWriter() {
+  if (!isRecordingActive() || g_sdLogQueue == nullptr) {
+    return;
+  }
+
   if (!takeCanSpiMutex()) {
     g_sdError = true;
     Serial.println("SD,ERR,MUTEX");
-    return false;
+    return;
   }
 
   // Keep MCP2515 deselected while talking to SD on shared HSPI.
   digitalWrite(kMcp2515CsPin, HIGH);
 
-  if (g_logFile.println(line) == 0) {
-    giveCanSpiMutex();
-    g_sdError = true;
-    closeLogFile();
-    Serial.println("SD,ERR,WRITE");
-    return false;
-  }
+  SdLogEntry entry = {};
+  bool writeError = false;
+  uint32_t writtenCount = 0;
+  while (writtenCount < kSdLogWriteBudgetPerLoop && xQueueReceive(g_sdLogQueue, &entry, 0) == pdTRUE) {
+    if (g_logFile.println(entry.text) == 0) {
+      writeError = true;
+      break;
+    }
 
-  ++g_logLineCount;
-  if ((g_logLineCount % 32U) == 0U) {
-    g_logFile.flush();
+    ++g_logLineCount;
+    ++writtenCount;
+    if ((g_logLineCount % 32U) == 0U) {
+      g_logFile.flush();
+    }
   }
 
   giveCanSpiMutex();
 
+  if (writeError) {
+    g_sdError = true;
+    closeLogFile();
+    Serial.println("SD,ERR,WRITE");
+    printSdState("SD,STATE");
+  }
+}
+
+const char kBase64Alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+bool base64Encode(const char *source, char *destination, const size_t destinationSize) {
+  if (source == nullptr || destination == nullptr || destinationSize == 0U) {
+    return false;
+  }
+
+  const size_t sourceLength = strlen(source);
+  const size_t requiredLength = ((sourceLength + 2U) / 3U) * 4U;
+  if (destinationSize <= requiredLength) {
+    destination[0] = '\0';
+    return false;
+  }
+
+  size_t inIndex = 0;
+  size_t outIndex = 0;
+  while (inIndex < sourceLength) {
+    const uint32_t octetA = static_cast<uint8_t>(source[inIndex++]);
+    const bool hasB = inIndex < sourceLength;
+    const uint32_t octetB = hasB ? static_cast<uint8_t>(source[inIndex++]) : 0U;
+    const bool hasC = inIndex < sourceLength;
+    const uint32_t octetC = hasC ? static_cast<uint8_t>(source[inIndex++]) : 0U;
+
+    const uint32_t triple = (octetA << 16) | (octetB << 8) | octetC;
+    destination[outIndex++] = kBase64Alphabet[(triple >> 18) & 0x3FU];
+    destination[outIndex++] = kBase64Alphabet[(triple >> 12) & 0x3FU];
+    destination[outIndex++] = hasB ? kBase64Alphabet[(triple >> 6) & 0x3FU] : '=';
+    destination[outIndex++] = hasC ? kBase64Alphabet[triple & 0x3FU] : '=';
+  }
+
+  destination[outIndex] = '\0';
   return true;
+}
+
+bool readClientLine(Client &client, char *buffer, const size_t bufferSize, const uint32_t timeoutMs) {
+  if (buffer == nullptr || bufferSize == 0U) {
+    return false;
+  }
+
+  size_t index = 0;
+  const uint32_t startMs = millis();
+  while ((millis() - startMs) < timeoutMs) {
+    while (client.available() > 0) {
+      const int value = client.read();
+      if (value < 0) {
+        continue;
+      }
+
+      const char ch = static_cast<char>(value);
+      if (ch == '\r') {
+        continue;
+      }
+      if (ch == '\n') {
+        buffer[index] = '\0';
+        return true;
+      }
+      if (index + 1U < bufferSize) {
+        buffer[index++] = ch;
+      }
+    }
+
+    delay(1);
+  }
+
+  buffer[index] = '\0';
+  return index > 0U;
+}
+
+void formatNmeaCoordinate(const int32_t valueE7, const bool latitude, char *buffer, const size_t bufferSize, char &hemisphere) {
+  const int32_t absoluteValue = valueE7 < 0 ? -valueE7 : valueE7;
+  const int32_t degrees = absoluteValue / 10000000L;
+  const int32_t fractionalE7 = absoluteValue % 10000000L;
+  const uint32_t scaledMinutes = static_cast<uint32_t>((static_cast<int64_t>(fractionalE7) * 6000000LL) / 10000000LL);
+  const uint32_t minuteWhole = scaledMinutes / 100000U;
+  const uint32_t minuteFrac = scaledMinutes % 100000U;
+
+  hemisphere = latitude ? (valueE7 >= 0 ? 'N' : 'S') : (valueE7 >= 0 ? 'E' : 'W');
+  snprintf(buffer,
+           bufferSize,
+           latitude ? "%02ld%02lu.%05lu" : "%03ld%02lu.%05lu",
+           static_cast<long>(degrees),
+           static_cast<unsigned long>(minuteWhole),
+           static_cast<unsigned long>(minuteFrac));
+}
+
+bool buildGgaSentence(const GnssState &state, char *buffer, const size_t bufferSize) {
+  if (buffer == nullptr || bufferSize == 0U || state.latitudeE7 == 0 || state.longitudeE7 == 0) {
+    return false;
+  }
+
+  char latitudeText[20] = {};
+  char longitudeText[20] = {};
+  char latHemisphere = 'N';
+  char lonHemisphere = 'E';
+  formatNmeaCoordinate(state.latitudeE7, true, latitudeText, sizeof(latitudeText), latHemisphere);
+  formatNmeaCoordinate(state.longitudeE7, false, longitudeText, sizeof(longitudeText), lonHemisphere);
+
+  const int quality = (state.carrierSolution == 2U) ? 4 : ((state.carrierSolution == 1U) ? 5 : (state.fixType >= 3U ? 1 : 0));
+  const int altitudeWhole = state.altitudeMslMm / 1000;
+  const int altitudeFrac = abs(state.altitudeMslMm % 1000);
+
+  char body[128] = {};
+  snprintf(body,
+           sizeof(body),
+           "GPGGA,000000.00,%s,%c,%s,%c,%d,%u,1.0,%d.%03d,M,0.0,M,,",
+           latitudeText,
+           latHemisphere,
+           longitudeText,
+           lonHemisphere,
+           quality,
+           static_cast<unsigned int>(state.siv),
+           altitudeWhole,
+           altitudeFrac);
+
+  uint8_t checksum = 0;
+  for (size_t index = 0; body[index] != '\0'; ++index) {
+    checksum ^= static_cast<uint8_t>(body[index]);
+  }
+
+  snprintf(buffer, bufferSize, "$%s*%02X\r\n", body, checksum);
+  return true;
+}
+
+void printGnssState(const char *prefix) {
+  const GnssState state = copyGnssState();
+  Serial.printf(
+      "%s,UART=%u,READY=%u,CFG=%u,UART_BAUD=%lu,FIX_VALID=%u,FIX=%u,CARR=%u,SIV=%u,LAT_E7=%ld,LON_E7=%ld,ALT_MM=%ld,HACC_MM=%ld,VACC_MM=%ld,TOW=%lu,PVT=%lu,TIMEPULSE=%u,EVENT=%s,ERR=%s\n",
+      prefix,
+      state.uartReady ? 1U : 0U,
+      state.moduleReady ? 1U : 0U,
+      state.configured ? 1U : 0U,
+      static_cast<unsigned long>(state.uartBaud),
+      state.fixValid ? 1U : 0U,
+      state.fixType,
+      state.carrierSolution,
+      state.siv,
+      static_cast<long>(state.latitudeE7),
+      static_cast<long>(state.longitudeE7),
+      static_cast<long>(state.altitudeMslMm),
+      static_cast<long>(state.horizontalAccuracyMm),
+      static_cast<long>(state.verticalAccuracyMm),
+      static_cast<unsigned long>(state.timeOfWeekMs),
+      static_cast<unsigned long>(state.pvtCount),
+      state.timePulseHigh ? 1U : 0U,
+      state.lastEvent,
+      state.lastError);
+}
+
+void printModemState(const char *prefix) {
+  const CellularState state = copyCellularState();
+  const uint32_t uptimeMs = millis();
+  const bool bootWindowElapsed = uptimeMs >= 12000U;
+  Serial.printf(
+  "%s,UART=%u,UART_BAUD=%lu,UART_TARGET=%lu,UART_PROBE=%lu,FLOW=%u,HIGH=%u,READY=%u,SIM=%u,NET=%u,GPRS=%u,INTERNET=%u,CSQ=%d,HTTP_CODE=%lu,APN=%s,IP=%s,OP=%s,INFO=%s,BOOT12=%u,UP_MS=%lu,EVENT=%s,ERR=%s\n",
+      prefix,
+      state.uartReady ? 1U : 0U,
+  static_cast<unsigned long>(state.uartBaud),
+  static_cast<unsigned long>(state.uartTargetBaud),
+  static_cast<unsigned long>(state.uartLastProbeBaud),
+  state.uartHardwareFlow ? 1U : 0U,
+  state.uartHighSpeedActive ? 1U : 0U,
+      state.modemReady ? 1U : 0U,
+      state.simReady ? 1U : 0U,
+      state.networkReady ? 1U : 0U,
+      state.gprsReady ? 1U : 0U,
+      state.internetOk ? 1U : 0U,
+      state.signalQuality,
+      static_cast<unsigned long>(state.httpStatusCode),
+      state.apn,
+      state.ipAddress,
+      state.operatorName,
+      state.modemInfo,
+      bootWindowElapsed ? 1U : 0U,
+      static_cast<unsigned long>(uptimeMs),
+      state.lastModemEvent,
+      state.lastModemError);
+}
+
+void printNtripState(const char *prefix) {
+  const CellularState state = copyCellularState();
+  Serial.printf(
+      "%s,CFG=%u,EN=%u,SOCK=%u,HOST=%s,PORT=%u,MOUNT=%s,RTCM_BYTES=%lu,GGA_TX=%lu,RECONNECTS=%lu,EVENT=%s,ERR=%s\n",
+      prefix,
+      state.ntripConfigured ? 1U : 0U,
+      state.ntripEnabled ? 1U : 0U,
+      state.ntripConnected ? 1U : 0U,
+      state.ntripHost,
+      static_cast<unsigned int>(state.ntripPort),
+      state.ntripMount,
+      static_cast<unsigned long>(state.ntripBytesRx),
+      static_cast<unsigned long>(state.ntripGgaTxCount),
+      static_cast<unsigned long>(state.ntripReconnectCount),
+      state.lastNtripEvent,
+      state.lastNtripError);
+}
+
+    void printMqttState(const char *prefix) {
+      const CellularState state = copyCellularState();
+      Serial.printf(
+      "%s,CFG=%u,EN=%u,SOCK=%u,HOST=%s,PORT=%u,CLIENT=%s,PREFIX=%s,TX=%lu,RX=%lu,RECONNECTS=%lu,DROPPED=%lu,EVENT=%s,ERR=%s\n",
+      prefix,
+      state.mqttConfigured ? 1U : 0U,
+      state.mqttEnabled ? 1U : 0U,
+      state.mqttConnected ? 1U : 0U,
+      state.mqttHost,
+      static_cast<unsigned int>(state.mqttPort),
+      state.mqttClientId,
+      state.mqttTopicPrefix,
+      static_cast<unsigned long>(state.mqttPublishCount),
+      static_cast<unsigned long>(state.mqttReceiveCount),
+      static_cast<unsigned long>(state.mqttReconnectCount),
+      static_cast<unsigned long>(g_mqttClient.droppedMessages()),
+      state.lastMqttEvent,
+      state.lastMqttError);
+    }
+
+void requestGnssHardwareReset() {
+  g_gnssResetRequested = true;
+}
+
+void applyGnssHardwareReset() {
+  digitalWrite(kGnssResetPin, LOW);
+  delay(50);
+  digitalWrite(kGnssResetPin, HIGH);
+  delay(250);
+}
+
+bool configureGnssModule() {
+  for (size_t index = 0; index < (sizeof(kGnssUartBaudCandidates) / sizeof(kGnssUartBaudCandidates[0])); ++index) {
+    const uint32_t baudRate = kGnssUartBaudCandidates[index];
+    gnssSerial.end();
+    gnssSerial.begin(baudRate, SERIAL_8N1, kGnssEspRxPin, kGnssEspTxPin);
+    delay(100);
+
+    bool started = false;
+    bool configured = false;
+    if (takeMutex(g_gnssUartMutex, pdMS_TO_TICKS(50))) {
+      started = g_gnss.begin(gnssSerial);
+      if (started) {
+        if (baudRate != kGnssTargetUartBaud) {
+          g_gnss.setSerialRate(kGnssTargetUartBaud, COM_PORT_UART1);
+          delay(100);
+          gnssSerial.flush();
+          gnssSerial.end();
+          gnssSerial.begin(kGnssTargetUartBaud, SERIAL_8N1, kGnssEspRxPin, kGnssEspTxPin);
+          delay(100);
+          started = g_gnss.begin(gnssSerial);
+        }
+        if (started) {
+          configured = g_gnss.setUART1Output(COM_TYPE_UBX) &&
+                       g_gnss.setPortInput(COM_PORT_UART1, COM_TYPE_UBX | COM_TYPE_RTCM3) &&
+                       g_gnss.setNavigationFrequency(static_cast<uint8_t>(kGnssNavigationFrequencyHz)) &&
+                       g_gnss.setAutoPVT(true) &&
+                       g_gnss.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT);
+        }
+      }
+      giveMutex(g_gnssUartMutex);
+    }
+
+    if (!started) {
+      continue;
+    }
+
+    if (takeMutex(g_gnssStateMutex, pdMS_TO_TICKS(10))) {
+      g_gnssState.uartReady = true;
+      g_gnssState.moduleReady = true;
+      g_gnssState.configured = configured;
+      g_gnssState.uartBaud = started ? kGnssTargetUartBaud : baudRate;
+      copyText(g_gnssState.lastEvent, sizeof(g_gnssState.lastEvent), configured ? "GNSS_OK" : "GNSS_PARTIAL_CFG");
+      copyText(g_gnssState.lastError, sizeof(g_gnssState.lastError), configured ? "-" : "CFG_FAIL");
+      giveMutex(g_gnssStateMutex);
+    }
+
+    return true;
+  }
+
+  if (takeMutex(g_gnssStateMutex, pdMS_TO_TICKS(10))) {
+    g_gnssState.uartReady = true;
+    g_gnssState.moduleReady = false;
+    g_gnssState.configured = false;
+    copyText(g_gnssState.lastEvent, sizeof(g_gnssState.lastEvent), "GNSS_NOT_FOUND");
+    copyText(g_gnssState.lastError, sizeof(g_gnssState.lastError), "UART_LINK_FAIL");
+    giveMutex(g_gnssStateMutex);
+  }
+  return false;
+}
+
+void updateGnssSolution() {
+  bool gotPvt = false;
+  GnssState updatedState = copyGnssState();
+  updatedState.timePulseHigh = digitalRead(kGnssTimePulsePin) == HIGH;
+
+  if (takeMutex(g_gnssUartMutex, pdMS_TO_TICKS(20))) {
+    gotPvt = g_gnss.getPVT();
+    if (gotPvt) {
+      updatedState.fixType = g_gnss.getFixType();
+      updatedState.carrierSolution = g_gnss.getCarrierSolutionType();
+      updatedState.siv = g_gnss.getSIV();
+      updatedState.latitudeE7 = g_gnss.getLatitude();
+      updatedState.longitudeE7 = g_gnss.getLongitude();
+      updatedState.altitudeMslMm = g_gnss.getAltitudeMSL();
+      updatedState.horizontalAccuracyMm = g_gnss.getHorizontalAccEst();
+      updatedState.verticalAccuracyMm = g_gnss.getVerticalAccEst();
+      updatedState.timeOfWeekMs = g_gnss.getTimeOfWeek();
+      updatedState.invalidLlh = g_gnss.getInvalidLlh();
+    }
+    giveMutex(g_gnssUartMutex);
+  }
+
+  if (!gotPvt) {
+    if (takeMutex(g_gnssStateMutex, pdMS_TO_TICKS(10))) {
+      g_gnssState.timePulseHigh = updatedState.timePulseHigh;
+      giveMutex(g_gnssStateMutex);
+    }
+    return;
+  }
+
+  updatedState.fixValid = !updatedState.invalidLlh && updatedState.fixType >= 3U;
+  updatedState.lastPvtMillis = millis();
+  updatedState.pvtCount++;
+  copyText(updatedState.lastEvent, sizeof(updatedState.lastEvent), "PVT_OK");
+  copyText(updatedState.lastError, sizeof(updatedState.lastError), "-");
+
+  if (takeMutex(g_gnssStateMutex, pdMS_TO_TICKS(10))) {
+    g_gnssState = updatedState;
+    giveMutex(g_gnssStateMutex);
+  }
+}
+
+void gnssServiceTask(void *parameter) {
+  (void)parameter;
+  for (;;) {
+    if (g_gnssResetRequested) {
+      g_gnssResetRequested = false;
+      setGnssEvent("GNSS_RESET", "-");
+      applyGnssHardwareReset();
+      if (takeMutex(g_gnssStateMutex, pdMS_TO_TICKS(10))) {
+        g_gnssState.moduleReady = false;
+        g_gnssState.configured = false;
+        giveMutex(g_gnssStateMutex);
+      }
+    }
+
+    const GnssState state = copyGnssState();
+    if (!state.moduleReady) {
+      configureGnssModule();
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
+    updateGnssSolution();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void updateModemUartState(const uint32_t activeBaud, const uint32_t probeBaud) {
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.uartReady = true;
+    g_cellularState.uartBaud = activeBaud;
+    g_cellularState.uartTargetBaud = kModemTargetUartBaud;
+    g_cellularState.uartLastProbeBaud = probeBaud;
+    g_cellularState.uartHardwareFlow = true;
+    g_cellularState.uartHighSpeedActive = g_modemHighSpeedConfigured && activeBaud == kModemTargetUartBaud;
+    giveMutex(g_cellularStateMutex);
+  }
+}
+
+void configureModemUart(const uint32_t baudRate = kModemStandardUartBaud) {
+  modemSerial.end();
+  modemSerial.begin(baudRate, SERIAL_8N1, kModemEspRxPin, kModemEspTxPin);
+  uart_set_mode(UART_NUM_2, UART_MODE_UART);
+  // ESP32 RTS output must drive the module CTS pin, and ESP32 CTS input
+  // must read the module RTS pin.
+  uart_set_pin(UART_NUM_2, kModemEspTxPin, kModemEspRxPin, kModemCtsPin, kModemRtsPin);
+  uart_set_hw_flow_ctrl(UART_NUM_2, UART_HW_FLOWCTRL_CTS_RTS, 64);
+  updateModemUartState(baudRate, baudRate);
+}
+
+bool promoteModemUartToTarget() {
+  if (g_modemHighSpeedConfigured || kModemTargetUartBaud == kModemStandardUartBaud) {
+    return true;
+  }
+
+  if (!g_modem.setBaud(kModemTargetUartBaud)) {
+    setModemEvent("MODEM_UART_FAIL", "AT+IPR");
+    return false;
+  }
+
+  delay(100);
+  g_modemHighSpeedConfigured = true;
+  configureModemUart(kModemTargetUartBaud);
+  delay(100);
+  if (!g_modem.testAT(kModemAtProbeTimeoutMs)) {
+    g_modemHighSpeedConfigured = false;
+    configureModemUart(kModemStandardUartBaud);
+    setModemEvent("MODEM_UART_FAIL", "BAUD_SWITCH");
+    return false;
+  }
+
+  updateModemUartState(kModemTargetUartBaud, kModemStandardUartBaud);
+  setModemEvent("MODEM_UART_OK", "-");
+  return true;
+}
+
+void pulseModemPowerKey() {
+  // IO2 drives an NMOS low-side switch, so HIGH on the ESP32 pulls the
+  // SIM7600 PWRKEY pin low. The module datasheet calls for a 100-500 ms
+  // active-low pulse, then roughly 12 s before the UART is ready.
+  digitalWrite(kModemPwrKeyPin, HIGH);
+  vTaskDelay(pdMS_TO_TICKS(kModemPowerKeyAssertMs));
+  digitalWrite(kModemPwrKeyPin, LOW);
+  g_lastModemPowerKeyPulseMs = millis();
+  g_modemHighSpeedConfigured = false;
+  g_modemPowerKeyBootPending = true;
+}
+
+void pulseModemResetPin() {
+  digitalWrite(kModemResetPin, HIGH);
+  vTaskDelay(pdMS_TO_TICKS(150));
+  digitalWrite(kModemResetPin, LOW);
+  g_modemHighSpeedConfigured = false;
+  vTaskDelay(pdMS_TO_TICKS(2500));
+}
+
+bool synchronizeModemUart() {
+  for (size_t index = 0; index < (sizeof(kModemUartBaudCandidates) / sizeof(kModemUartBaudCandidates[0])); ++index) {
+    const uint32_t baudRate = kModemUartBaudCandidates[index];
+    configureModemUart(baudRate);
+    updateModemUartState(baudRate, baudRate);
+    delay(100);
+    if (!g_modem.testAT(kModemAtProbeTimeoutMs)) {
+      continue;
+    }
+
+    g_modemHighSpeedConfigured = baudRate == kModemTargetUartBaud;
+    updateModemUartState(baudRate, baudRate);
+
+    if (baudRate != kModemTargetUartBaud && !promoteModemUartToTarget()) {
+      return false;
+    }
+
+    setModemEvent("MODEM_UART_OK", "-");
+    return true;
+  }
+
+  setModemEvent("MODEM_UART_FAIL", "AT_TIMEOUT");
+  return false;
+}
+
+void refreshModemNetworkSnapshot(const bool force = false) {
+  const uint32_t nowMs = millis();
+  if (!force && (nowMs - g_lastModemSnapshotMs) < kModemSnapshotPeriodMs) {
+    return;
+  }
+
+  CellularState updatedState = copyCellularState();
+  updatedState.signalQuality = g_modem.getSignalQuality();
+  updatedState.networkReady = g_modem.isNetworkConnected();
+  updatedState.gprsReady = g_modem.isGprsConnected();
+  updatedState.simReady = g_modem.getSimStatus() == SIM_READY;
+  updatedState.lastNetworkMillis = nowMs;
+  sanitizeString(g_modem.getOperator(), updatedState.operatorName, sizeof(updatedState.operatorName));
+  sanitizeString(g_modem.localIP().toString(), updatedState.ipAddress, sizeof(updatedState.ipAddress));
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.signalQuality = updatedState.signalQuality;
+    g_cellularState.networkReady = updatedState.networkReady;
+    g_cellularState.gprsReady = updatedState.gprsReady;
+    g_cellularState.simReady = updatedState.simReady;
+    g_cellularState.lastNetworkMillis = updatedState.lastNetworkMillis;
+    copyText(g_cellularState.operatorName, sizeof(g_cellularState.operatorName), updatedState.operatorName);
+    copyText(g_cellularState.ipAddress, sizeof(g_cellularState.ipAddress), updatedState.ipAddress);
+    giveMutex(g_cellularStateMutex);
+  }
+  g_lastModemSnapshotMs = nowMs;
+}
+
+bool ensureModemReady() {
+  const uint32_t nowMs = millis();
+  const CellularState state = copyCellularState();
+
+  if (g_modemPowerKeyBootPending) {
+    const uint32_t bootElapsedMs = nowMs - g_lastModemPowerKeyPulseMs;
+    if (bootElapsedMs < kModemPowerKeyBootWaitMs) {
+      setModemEvent("MODEM_BOOT_WAIT", "PWRKEY_BOOT");
+      return false;
+    }
+    g_modemPowerKeyBootPending = false;
+    setModemEvent(bootElapsedMs <= kModemPowerKeyBootMaxMs ? "MODEM_BOOT_READY" : "MODEM_BOOT_LATE", "-");
+  }
+
+  if (state.modemReady && g_modemInitialized && (nowMs - g_lastModemReadyProbeMs) < kModemReadyProbePeriodMs) {
+    return true;
+  }
+
+  g_lastModemReadyProbeMs = nowMs;
+
+  if (!g_modem.testAT(kModemAtProbeTimeoutMs)) {
+    g_modemInitialized = false;
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.modemReady = false;
+      g_cellularState.networkReady = false;
+      g_cellularState.gprsReady = false;
+      g_cellularState.internetOk = false;
+      copyText(g_cellularState.lastModemError, sizeof(g_cellularState.lastModemError), "MODEM_NO_AT");
+      giveMutex(g_cellularStateMutex);
+    }
+
+    if ((nowMs - g_lastModemRecoveryAttemptMs) < kModemRecoveryRetryMs) {
+      setModemEvent("MODEM_AT_WAIT", "AT_TIMEOUT");
+      return false;
+    }
+
+    g_lastModemRecoveryAttemptMs = nowMs;
+    ++g_modemAtFailureCount;
+    if (!synchronizeModemUart()) {
+      return false;
+    }
+    if (g_modem.testAT(kModemAtProbeTimeoutMs)) {
+      g_modemAtFailureCount = 0;
+    } else if (g_modemAtFailureCount == 2U) {
+      setModemEvent("MODEM_PWRKEY", "AT_TIMEOUT");
+      g_modemInitialized = false;
+      pulseModemPowerKey();
+      return false;
+    } else if (g_modemAtFailureCount >= 4U) {
+      setModemEvent("MODEM_RESET", "AT_TIMEOUT");
+      pulseModemResetPin();
+      g_modemAtFailureCount = 0;
+      return false;
+    } else {
+      setModemEvent("MODEM_AT_WAIT", "AT_TIMEOUT");
+      return false;
+    }
+  }
+
+  CellularState currentState = copyCellularState();
+  if (currentState.uartBaud == kModemTargetUartBaud) {
+    g_modemHighSpeedConfigured = true;
+    updateModemUartState(currentState.uartBaud, currentState.uartLastProbeBaud);
+  } else if (!promoteModemUartToTarget()) {
+    return false;
+  }
+
+  g_modemAtFailureCount = 0;
+
+  if (!g_modemInitialized) {
+    bool initialized = g_modem.init();
+    if (!initialized) {
+      initialized = g_modem.restart();
+    }
+    if (!initialized) {
+      if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+        g_cellularState.modemReady = false;
+        copyText(g_cellularState.lastModemError, sizeof(g_cellularState.lastModemError), "MODEM_INIT_FAIL");
+        giveMutex(g_cellularStateMutex);
+      }
+      return false;
+    }
+    g_modemInitialized = true;
+  }
+
+  CellularState updatedState = copyCellularState();
+  updatedState.modemReady = true;
+  updatedState.simReady = g_modem.getSimStatus() == SIM_READY;
+  sanitizeString(g_modem.getModemInfo(), updatedState.modemInfo, sizeof(updatedState.modemInfo));
+  copyText(updatedState.lastModemEvent, sizeof(updatedState.lastModemEvent), "MODEM_OK");
+  copyText(updatedState.lastModemError, sizeof(updatedState.lastModemError), "-");
+
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.modemReady = updatedState.modemReady;
+    g_cellularState.simReady = updatedState.simReady;
+    copyText(g_cellularState.modemInfo, sizeof(g_cellularState.modemInfo), updatedState.modemInfo);
+    copyText(g_cellularState.lastModemEvent, sizeof(g_cellularState.lastModemEvent), updatedState.lastModemEvent);
+    copyText(g_cellularState.lastModemError, sizeof(g_cellularState.lastModemError), updatedState.lastModemError);
+    giveMutex(g_cellularStateMutex);
+  }
+
+  refreshModemNetworkSnapshot(true);
+  return true;
+}
+
+bool ensurePacketDataSession() {
+  const CellularState state = copyCellularState();
+  if (!ensureModemReady()) {
+    return false;
+  }
+
+  if (!g_modem.isNetworkConnected() && !g_modem.waitForNetwork(30000L, true)) {
+    setModemEvent("NETWORK_WAIT_FAIL", "NO_NETWORK");
+    refreshModemNetworkSnapshot(true);
+    return false;
+  }
+
+  const char *apn = state.apn;
+  const char *apnUser = state.apnUser;
+  const char *apnPass = state.apnPass;
+  if (!g_modem.isGprsConnected() && !g_modem.gprsConnect(apn, apnUser, apnPass)) {
+    setModemEvent("GPRS_CONNECT_FAIL", "NO_PDP");
+    refreshModemNetworkSnapshot(true);
+    return false;
+  }
+
+  refreshModemNetworkSnapshot(true);
+  setModemEvent("GPRS_OK", "-");
+  return true;
+}
+
+bool runHttpConnectivityTest() {
+  const CellularState state = copyCellularState();
+  if (!ensurePacketDataSession()) {
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.internetOk = false;
+      g_cellularState.httpStatusCode = 0;
+      g_cellularState.lastHttpTestMillis = millis();
+      giveMutex(g_cellularStateMutex);
+    }
+    return false;
+  }
+
+  g_httpClient.stop();
+  if (!g_httpClient.connect(state.httpHost, 80)) {
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.internetOk = false;
+      g_cellularState.httpStatusCode = 0;
+      g_cellularState.lastHttpTestMillis = millis();
+      copyText(g_cellularState.lastModemEvent, sizeof(g_cellularState.lastModemEvent), "HTTP_CONNECT_FAIL");
+      copyText(g_cellularState.lastModemError, sizeof(g_cellularState.lastModemError), "HTTP_SOCKET");
+      giveMutex(g_cellularStateMutex);
+    }
+    return false;
+  }
+
+  g_httpClient.print("GET ");
+  g_httpClient.print((state.httpPath[0] != '\0') ? state.httpPath : "/");
+  g_httpClient.print(" HTTP/1.0\r\nHost: ");
+  g_httpClient.print(state.httpHost);
+  g_httpClient.print("\r\nConnection: close\r\n\r\n");
+
+  char statusLine[128] = {};
+  int statusCode = 0;
+  const bool gotStatusLine = readClientLine(g_httpClient, statusLine, sizeof(statusLine), 5000U);
+  if (gotStatusLine) {
+    if (sscanf(statusLine, "HTTP/%*s %d", &statusCode) != 1 && strstr(statusLine, "ICY 200") != nullptr) {
+      statusCode = 200;
+    }
+  }
+
+  const bool ok = statusCode >= 200 && statusCode < 400;
+  g_httpClient.stop();
+
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.internetOk = ok;
+    g_cellularState.httpStatusCode = static_cast<uint32_t>(statusCode);
+    g_cellularState.lastHttpTestMillis = millis();
+    copyText(g_cellularState.lastModemEvent, sizeof(g_cellularState.lastModemEvent), ok ? "HTTP_OK" : "HTTP_FAIL");
+    copyText(g_cellularState.lastModemError, sizeof(g_cellularState.lastModemError), ok ? "-" : (gotStatusLine ? statusLine : "HTTP_TIMEOUT"));
+    giveMutex(g_cellularStateMutex);
+  }
+
+  return ok;
+}
+
+void disconnectNtripSocket(const char *eventText, const char *errorText) {
+  g_ntripClient.stop();
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.ntripConnected = false;
+    copyText(g_cellularState.lastNtripEvent, sizeof(g_cellularState.lastNtripEvent), eventText);
+    copyText(g_cellularState.lastNtripError, sizeof(g_cellularState.lastNtripError), errorText);
+    giveMutex(g_cellularStateMutex);
+  }
+}
+
+bool connectNtripSocket() {
+  CellularState state = copyCellularState();
+  if (!state.ntripConfigured || !state.ntripEnabled) {
+    return false;
+  }
+  if (!ensurePacketDataSession()) {
+    return false;
+  }
+
+  g_ntripClient.stop();
+  if (!g_ntripClient.connect(state.ntripHost, static_cast<int>(state.ntripPort))) {
+    disconnectNtripSocket("CONNECT_FAIL", "NTRIP_SOCKET");
+    return false;
+  }
+
+  char authPlain[96] = {};
+  char authEncoded[160] = {};
+  if (state.ntripUser[0] != '\0' || state.ntripPass[0] != '\0') {
+    snprintf(authPlain, sizeof(authPlain), "%s:%s", state.ntripUser, state.ntripPass);
+    if (!base64Encode(authPlain, authEncoded, sizeof(authEncoded))) {
+      disconnectNtripSocket("AUTH_FAIL", "NTRIP_AUTH_ENCODE");
+      return false;
+    }
+  }
+
+  g_ntripClient.print("GET /");
+  g_ntripClient.print(state.ntripMount);
+  g_ntripClient.print(" HTTP/1.0\r\nUser-Agent: NTRIP ESP32S3\r\nAccept: */*\r\nConnection: close\r\n");
+  if (authEncoded[0] != '\0') {
+    g_ntripClient.print("Authorization: Basic ");
+    g_ntripClient.print(authEncoded);
+    g_ntripClient.print("\r\n");
+  }
+  g_ntripClient.print("\r\n");
+
+  char headerLine[128] = {};
+  if (!readClientLine(g_ntripClient, headerLine, sizeof(headerLine), 5000U)) {
+    disconnectNtripSocket("HEADER_FAIL", "NTRIP_TIMEOUT");
+    return false;
+  }
+
+  if (strstr(headerLine, "200") == nullptr && strstr(headerLine, "ICY") == nullptr) {
+    disconnectNtripSocket("HEADER_FAIL", headerLine);
+    return false;
+  }
+
+  while (readClientLine(g_ntripClient, headerLine, sizeof(headerLine), 1000U)) {
+    if (headerLine[0] == '\0') {
+      break;
+    }
+  }
+
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.ntripConnected = true;
+    g_cellularState.ntripReconnectCount++;
+    g_cellularState.lastNtripDataMillis = millis();
+    copyText(g_cellularState.lastNtripEvent, sizeof(g_cellularState.lastNtripEvent), "NTRIP_OK");
+    copyText(g_cellularState.lastNtripError, sizeof(g_cellularState.lastNtripError), "-");
+    giveMutex(g_cellularStateMutex);
+  }
+
+  return true;
+}
+
+void maybeSendNtripGga() {
+  static uint32_t lastGgaMs = 0;
+  const uint32_t nowMs = millis();
+  if ((nowMs - lastGgaMs) < kNtripGgaPeriodMs) {
+    return;
+  }
+
+  const GnssState gnssState = copyGnssState();
+  char ggaSentence[160] = {};
+  if (!buildGgaSentence(gnssState, ggaSentence, sizeof(ggaSentence))) {
+    return;
+  }
+
+  g_ntripClient.print(ggaSentence);
+  lastGgaMs = nowMs;
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.ntripGgaTxCount++;
+    giveMutex(g_cellularStateMutex);
+  }
+}
+
+void serviceNtripStream() {
+  CellularState state = copyCellularState();
+
+  if (g_ntripDisableRequested) {
+    g_ntripDisableRequested = false;
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.ntripEnabled = false;
+      giveMutex(g_cellularStateMutex);
+    }
+    disconnectNtripSocket("NTRIP_OFF", "-");
+    return;
+  }
+
+  if (g_ntripEnableRequested) {
+    g_ntripEnableRequested = false;
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.ntripEnabled = true;
+      giveMutex(g_cellularStateMutex);
+    }
+    state = copyCellularState();
+  }
+
+  if (!state.ntripEnabled) {
+    if (state.ntripConnected) {
+      disconnectNtripSocket("NTRIP_OFF", "-");
+    }
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  static uint32_t lastConnectAttemptMs = 0;
+  if (!state.ntripConnected) {
+    if ((nowMs - lastConnectAttemptMs) >= kNtripReconnectPeriodMs) {
+      lastConnectAttemptMs = nowMs;
+      connectNtripSocket();
+    }
+    return;
+  }
+
+  maybeSendNtripGga();
+
+  uint8_t rtcmBuffer[256] = {};
+  size_t bufferCount = 0;
+  while (g_ntripClient.available() > 0 && bufferCount < sizeof(rtcmBuffer)) {
+    const int value = g_ntripClient.read();
+    if (value >= 0) {
+      rtcmBuffer[bufferCount++] = static_cast<uint8_t>(value);
+    }
+  }
+
+  if (bufferCount > 0U) {
+    if (takeMutex(g_gnssUartMutex, pdMS_TO_TICKS(20))) {
+      gnssSerial.write(rtcmBuffer, bufferCount);
+      giveMutex(g_gnssUartMutex);
+    }
+
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.ntripBytesRx += static_cast<uint32_t>(bufferCount);
+      g_cellularState.lastNtripDataMillis = nowMs;
+      giveMutex(g_cellularStateMutex);
+    }
+  }
+
+  state = copyCellularState();
+  if (!g_ntripClient.connected() || (state.lastNtripDataMillis != 0U && (nowMs - state.lastNtripDataMillis) > kNtripIdleTimeoutMs)) {
+    disconnectNtripSocket("NTRIP_RETRY", g_ntripClient.connected() ? "IDLE_TIMEOUT" : "SOCKET_CLOSED");
+  }
+}
+
+bool dispatchControlCommand(const char *line);
+
+bool buildMqttTopic(const CellularState &state, const char *suffix, char *buffer, const size_t bufferSize) {
+  if (suffix == nullptr || buffer == nullptr || bufferSize == 0U) {
+    return false;
+  }
+
+  const char *prefix = (state.mqttTopicPrefix[0] != '\0') ? state.mqttTopicPrefix : "szen/telemetry/node";
+  const int written = snprintf(buffer, bufferSize, "%s/%s", prefix, suffix);
+  return written > 0 && static_cast<size_t>(written) < bufferSize;
+}
+
+void markMqttPublish(const bool published) {
+  if (!published || !takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    return;
+  }
+
+  g_cellularState.mqttPublishCount++;
+  g_cellularState.lastMqttTxMillis = millis();
+  giveMutex(g_cellularStateMutex);
+}
+
+bool mqttPublishText(const char *suffix, const char *payload, const bool retained, const int qos) {
+  const CellularState state = copyCellularState();
+  if (!state.mqttConnected || payload == nullptr) {
+    return false;
+  }
+
+  char topic[kMqttTopicBufferSize] = {};
+  if (!buildMqttTopic(state, suffix, topic, sizeof(topic))) {
+    return false;
+  }
+
+  const bool published = g_mqttClient.publish(topic, payload, retained, qos);
+  markMqttPublish(published);
+  if (!published) {
+    setMqttEvent("PUB_FAIL", "MQTT_PUBLISH");
+  }
+  return published;
+}
+
+void publishMqttStateSnapshots() {
+  const CellularState cellularState = copyCellularState();
+  const GnssState gnssState = copyGnssState();
+  char payload[kMqttPayloadBufferSize] = {};
+
+  snprintf(
+      payload,
+      sizeof(payload),
+      "MODEM,STATE,UART=%u,UART_BAUD=%lu,UART_TARGET=%lu,UART_PROBE=%lu,FLOW=%u,HIGH=%u,READY=%u,SIM=%u,NET=%u,GPRS=%u,INTERNET=%u,CSQ=%d,HTTP_CODE=%lu,APN=%s,IP=%s,OP=%s,INFO=%s,BOOT12=%u,UP_MS=%lu,EVENT=%s,ERR=%s",
+      cellularState.uartReady ? 1U : 0U,
+      static_cast<unsigned long>(cellularState.uartBaud),
+      static_cast<unsigned long>(cellularState.uartTargetBaud),
+      static_cast<unsigned long>(cellularState.uartLastProbeBaud),
+      cellularState.uartHardwareFlow ? 1U : 0U,
+      cellularState.uartHighSpeedActive ? 1U : 0U,
+      cellularState.modemReady ? 1U : 0U,
+      cellularState.simReady ? 1U : 0U,
+      cellularState.networkReady ? 1U : 0U,
+      cellularState.gprsReady ? 1U : 0U,
+      cellularState.internetOk ? 1U : 0U,
+      cellularState.signalQuality,
+      static_cast<unsigned long>(cellularState.httpStatusCode),
+      cellularState.apn,
+      cellularState.ipAddress,
+      cellularState.operatorName,
+      cellularState.modemInfo,
+      millis() >= 12000U ? 1U : 0U,
+      static_cast<unsigned long>(millis()),
+      cellularState.lastModemEvent,
+      cellularState.lastModemError);
+  mqttPublishText("state/modem", payload, true, 1);
+
+  snprintf(
+      payload,
+      sizeof(payload),
+      "GNSS,STATE,UART=%u,READY=%u,CFG=%u,FIX_VALID=%u,FIX=%u,CARR=%u,SIV=%u,LAT_E7=%ld,LON_E7=%ld,ALT_MM=%ld,HACC_MM=%ld,VACC_MM=%ld,TOW_MS=%lu,PVT_COUNT=%lu,TP=%u,EVENT=%s,ERR=%s",
+      gnssState.uartReady ? 1U : 0U,
+      gnssState.moduleReady ? 1U : 0U,
+      gnssState.configured ? 1U : 0U,
+      gnssState.fixValid ? 1U : 0U,
+      static_cast<unsigned int>(gnssState.fixType),
+      static_cast<unsigned int>(gnssState.carrierSolution),
+      static_cast<unsigned int>(gnssState.siv),
+      static_cast<long>(gnssState.latitudeE7),
+      static_cast<long>(gnssState.longitudeE7),
+      static_cast<long>(gnssState.altitudeMslMm),
+      static_cast<long>(gnssState.horizontalAccuracyMm),
+      static_cast<long>(gnssState.verticalAccuracyMm),
+      static_cast<unsigned long>(gnssState.timeOfWeekMs),
+      static_cast<unsigned long>(gnssState.pvtCount),
+      gnssState.timePulseHigh ? 1U : 0U,
+      gnssState.lastEvent,
+      gnssState.lastError);
+  mqttPublishText("state/gnss", payload, true, 1);
+
+  snprintf(
+      payload,
+      sizeof(payload),
+      "NTRIP,STATE,CFG=%u,EN=%u,SOCK=%u,HOST=%s,PORT=%u,MOUNT=%s,RTCM_BYTES=%lu,GGA_TX=%lu,RECONNECTS=%lu,EVENT=%s,ERR=%s",
+      cellularState.ntripConfigured ? 1U : 0U,
+      cellularState.ntripEnabled ? 1U : 0U,
+      cellularState.ntripConnected ? 1U : 0U,
+      cellularState.ntripHost,
+      static_cast<unsigned int>(cellularState.ntripPort),
+      cellularState.ntripMount,
+      static_cast<unsigned long>(cellularState.ntripBytesRx),
+      static_cast<unsigned long>(cellularState.ntripGgaTxCount),
+      static_cast<unsigned long>(cellularState.ntripReconnectCount),
+      cellularState.lastNtripEvent,
+      cellularState.lastNtripError);
+  mqttPublishText("state/ntrip", payload, true, 1);
+
+  snprintf(
+      payload,
+      sizeof(payload),
+      "MQTT,STATE,CFG=%u,EN=%u,SOCK=%u,HOST=%s,PORT=%u,CLIENT=%s,PREFIX=%s,TX=%lu,RX=%lu,RECONNECTS=%lu,DROPPED=%lu,EVENT=%s,ERR=%s",
+      cellularState.mqttConfigured ? 1U : 0U,
+      cellularState.mqttEnabled ? 1U : 0U,
+      cellularState.mqttConnected ? 1U : 0U,
+      cellularState.mqttHost,
+      static_cast<unsigned int>(cellularState.mqttPort),
+      cellularState.mqttClientId,
+      cellularState.mqttTopicPrefix,
+      static_cast<unsigned long>(cellularState.mqttPublishCount),
+      static_cast<unsigned long>(cellularState.mqttReceiveCount),
+      static_cast<unsigned long>(cellularState.mqttReconnectCount),
+      static_cast<unsigned long>(g_mqttClient.droppedMessages()),
+      cellularState.lastMqttEvent,
+      cellularState.lastMqttError);
+  mqttPublishText("state/mqtt", payload, true, 1);
+}
+
+void disconnectMqttBroker(const char *eventText, const char *errorText) {
+  const CellularState state = copyCellularState();
+  if (state.mqttConnected) {
+    mqttPublishText("availability", "offline", true, 1);
+  }
+  g_mqttClient.disconnect();
+  g_mqttTransport.stop();
+
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.mqttConnected = false;
+    copyText(g_cellularState.lastMqttEvent, sizeof(g_cellularState.lastMqttEvent), eventText);
+    copyText(g_cellularState.lastMqttError, sizeof(g_cellularState.lastMqttError), errorText);
+    giveMutex(g_cellularStateMutex);
+  }
+}
+
+void onMqttMessage(MQTTClient *client, char topic[], char bytes[], int length) {
+  (void)client;
+  (void)topic;
+  if (length <= 0) {
+    return;
+  }
+
+  int copyLength = length;
+  if (copyLength >= static_cast<int>(sizeof(g_pendingMqttCommand))) {
+    copyLength = static_cast<int>(sizeof(g_pendingMqttCommand)) - 1;
+  }
+
+  memcpy(g_pendingMqttCommand, bytes, static_cast<size_t>(copyLength));
+  while (copyLength > 0 && (g_pendingMqttCommand[copyLength - 1] == '\r' || g_pendingMqttCommand[copyLength - 1] == '\n')) {
+    copyLength--;
+  }
+  g_pendingMqttCommand[copyLength] = '\0';
+  g_pendingMqttCommandReady = copyLength > 0;
+
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.mqttReceiveCount++;
+    g_cellularState.lastMqttRxMillis = millis();
+    copyText(g_cellularState.lastMqttEvent, sizeof(g_cellularState.lastMqttEvent), "CMD_RX");
+    copyText(g_cellularState.lastMqttError, sizeof(g_cellularState.lastMqttError), "-");
+    giveMutex(g_cellularStateMutex);
+  }
+}
+
+bool connectMqttBroker() {
+  const CellularState state = copyCellularState();
+  if (!state.mqttConfigured || !state.mqttEnabled || state.mqttHost[0] == '\0' || state.mqttClientId[0] == '\0') {
+    return false;
+  }
+
+  if (!ensurePacketDataSession()) {
+    return false;
+  }
+
+  char availabilityTopic[kMqttTopicBufferSize] = {};
+  char controlTopic[kMqttTopicBufferSize] = {};
+  if (!buildMqttTopic(state, "availability", availabilityTopic, sizeof(availabilityTopic)) ||
+      !buildMqttTopic(state, "control/command", controlTopic, sizeof(controlTopic))) {
+    setMqttEvent("CFG_FAIL", "TOPIC_PATH");
+    return false;
+  }
+
+  g_mqttClient.begin(state.mqttHost, static_cast<int>(state.mqttPort), g_mqttTransport);
+  g_mqttClient.onMessageAdvanced(onMqttMessage);
+  g_mqttClient.setOptions(30, false, 1000);
+  g_mqttClient.dropOverflow(false);
+  g_mqttClient.setWill(availabilityTopic, "offline", true, 1);
+
+  const bool connected = (state.mqttUser[0] != '\0' || state.mqttPass[0] != '\0')
+      ? g_mqttClient.connect(state.mqttClientId, state.mqttUser, state.mqttPass)
+      : g_mqttClient.connect(state.mqttClientId);
+  if (!connected) {
+    char errorText[32] = {};
+    snprintf(
+        errorText,
+        sizeof(errorText),
+        "RC=%d ERR=%d",
+        static_cast<int>(g_mqttClient.returnCode()),
+        static_cast<int>(g_mqttClient.lastError()));
+    setMqttEvent("CONNECT_FAIL", errorText);
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.mqttConnected = false;
+      giveMutex(g_cellularStateMutex);
+    }
+    return false;
+  }
+
+  g_mqttClient.subscribe(controlTopic, 1);
+  if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+    g_cellularState.mqttConnected = true;
+    g_cellularState.mqttReconnectCount++;
+    copyText(g_cellularState.lastMqttEvent, sizeof(g_cellularState.lastMqttEvent), "MQTT_OK");
+    copyText(g_cellularState.lastMqttError, sizeof(g_cellularState.lastMqttError), "-");
+    giveMutex(g_cellularStateMutex);
+  }
+
+  mqttPublishText("availability", "online", true, 1);
+  publishMqttStateSnapshots();
+  return true;
+}
+
+void processPendingMqttCommand() {
+  if (!g_pendingMqttCommandReady) {
+    return;
+  }
+
+  char command[kSerialCommandBufferSize] = {};
+  strncpy(command, g_pendingMqttCommand, sizeof(command) - 1U);
+  g_pendingMqttCommandReady = false;
+
+  if (dispatchControlCommand(command)) {
+    mqttPublishText("event/command", command, false, 1);
+    g_mqttPublishStateRequested = true;
+  } else {
+    mqttPublishText("event/command_error", command, false, 1);
+  }
+}
+
+void serviceMqttLink() {
+  CellularState state = copyCellularState();
+
+  if (g_mqttDisableRequested) {
+    g_mqttDisableRequested = false;
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.mqttEnabled = false;
+      giveMutex(g_cellularStateMutex);
+    }
+    disconnectMqttBroker("MQTT_OFF", "-");
+    return;
+  }
+
+  if (g_mqttEnableRequested) {
+    g_mqttEnableRequested = false;
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      g_cellularState.mqttEnabled = true;
+      giveMutex(g_cellularStateMutex);
+    }
+    state = copyCellularState();
+  }
+
+  if (!state.mqttEnabled) {
+    if (state.mqttConnected) {
+      disconnectMqttBroker("MQTT_OFF", "-");
+    }
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  static uint32_t lastConnectAttemptMs = 0;
+  static uint32_t lastPublishMs = 0;
+
+  if (!state.mqttConnected) {
+    if ((nowMs - lastConnectAttemptMs) >= kMqttReconnectPeriodMs) {
+      lastConnectAttemptMs = nowMs;
+      connectMqttBroker();
+    }
+    return;
+  }
+
+  if (!g_mqttClient.loop() || !g_mqttClient.connected()) {
+    disconnectMqttBroker("MQTT_RETRY", "SOCKET_CLOSED");
+    return;
+  }
+
+  processPendingMqttCommand();
+
+  if (g_mqttPublishStateRequested || (nowMs - lastPublishMs) >= kMqttPublishPeriodMs) {
+    lastPublishMs = nowMs;
+    g_mqttPublishStateRequested = false;
+    publishMqttStateSnapshots();
+  }
+}
+
+bool modemServiceNeeded(const CellularState &state) {
+  return g_modemPowerKeyRequested ||
+         g_modemResetRequested ||
+         g_modemConnectRequested ||
+         g_modemDisconnectRequested ||
+         g_modemHttpTestRequested ||
+         state.mqttEnabled ||
+         state.ntripEnabled ||
+         state.gprsReady ||
+         state.modemReady;
+}
+
+void modemServiceTask(void *parameter) {
+  (void)parameter;
+  configureModemUart();
+  for (;;) {
+    const CellularState state = copyCellularState();
+    if (!modemServiceNeeded(state)) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
+    if (g_modemPowerKeyRequested) {
+      g_modemPowerKeyRequested = false;
+      g_modemInitialized = false;
+      pulseModemPowerKey();
+      setModemEvent("MODEM_PWRKEY", "MANUAL");
+      continue;
+    }
+
+    if (g_modemResetRequested) {
+      g_modemResetRequested = false;
+      pulseModemResetPin();
+      if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+        g_cellularState.modemReady = false;
+        g_cellularState.networkReady = false;
+        g_cellularState.gprsReady = false;
+        g_cellularState.internetOk = false;
+        giveMutex(g_cellularStateMutex);
+      }
+      g_modemInitialized = false;
+      setModemEvent("MODEM_RESET", "-");
+    }
+
+    if (!ensureModemReady()) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    if (g_modemDisconnectRequested) {
+      g_modemDisconnectRequested = false;
+      g_modem.gprsDisconnect();
+      refreshModemNetworkSnapshot(true);
+      setModemEvent("GPRS_OFF", "-");
+    }
+
+    if (g_modemConnectRequested) {
+      g_modemConnectRequested = false;
+      ensurePacketDataSession();
+    }
+
+    if (g_modemHttpTestRequested) {
+      g_modemHttpTestRequested = false;
+      runHttpConnectivityTest();
+    }
+
+    refreshModemNetworkSnapshot();
+    serviceMqttLink();
+    serviceNtripStream();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
 }
 
 void putInt16Le(uint8_t *buffer, const int index, const int16_t value) {
@@ -873,7 +2485,7 @@ void printAsm330InitState(const char *prefix) {
 
 void printAsm330DebugSnapshot(const char *prefix) {
   Serial.printf(
-      "%s,READY=%u,WHOAMI=0x%02X,IRQ=%lu,READ_ATTEMPTS=%lu,SAMPLES=%lu,INT_SRC=%lu,PIN_SRC=%lu,POLL_SRC=%lu,ZERO=%lu,NOSAMPLE=%lu,STATUS=0x%02X,DRDY_PIN=%d\n",
+  "%s,READY=%u,WHOAMI=0x%02X,IRQ=%lu,READ_ATTEMPTS=%lu,SAMPLES=%lu,INT_SRC=%lu,PIN_SRC=%lu,POLL_SRC=%lu,ZERO=%lu,NOSAMPLE=%lu,STATUS=0x%02X,DRDY_PIN=%d,SDA=%d,SCL=%d,SA0=%d,CS=%d\n",
       prefix,
       g_imuReady ? 1U : 0U,
       g_asm330LastWhoAmI,
@@ -886,12 +2498,46 @@ void printAsm330DebugSnapshot(const char *prefix) {
       static_cast<unsigned long>(g_asm330AllZeroSampleCount),
       static_cast<unsigned long>(g_asm330ConsecutiveNoSampleCount),
       g_asm330LastStatus,
-      digitalRead(kAsm330DrdyPin));
+      digitalRead(kAsm330DrdyPin),
+      digitalRead(kAsm330SdaPin),
+      digitalRead(kAsm330SclPin),
+      digitalRead(kAsm330Sa0Pin),
+      (kAsm330CsPin >= 0) ? digitalRead(kAsm330CsPin) : -1);
 
   Serial.print(prefix);
   Serial.print(",LAST_RAW,");
   printAsm330RawBuffer(g_asm330LastRawBytes, sizeof(g_asm330LastRawBytes));
   Serial.println();
+}
+
+void prepareAsm330I2cPins() {
+  pinMode(kAsm330DrdyPin, INPUT);
+  if (kAsm330CsPin >= 0) {
+    pinMode(kAsm330CsPin, OUTPUT);
+    digitalWrite(kAsm330CsPin, HIGH);
+  }
+
+  pinMode(kAsm330Sa0Pin, OUTPUT);
+  digitalWrite(kAsm330Sa0Pin, kAsm330Sa0High ? HIGH : LOW);
+}
+
+void printAsm330I2cScan(const char *prefix) {
+  const uint8_t addresses[] = {kAsm330I2cAddressLow, kAsm330I2cAddressHigh};
+  for (size_t index = 0; index < (sizeof(addresses) / sizeof(addresses[0])); ++index) {
+    const uint8_t address = addresses[index];
+    imuI2c.beginTransmission(address);
+    const uint8_t error = imuI2c.endTransmission(true);
+    Serial.printf(
+        "%s,ADDR=0x%02X,ACK=%u,ERR=%u,SDA=%d,SCL=%d,SA0=%d,CS=%d\n",
+        prefix,
+        address,
+        error == 0U ? 1U : 0U,
+        error,
+        digitalRead(kAsm330SdaPin),
+        digitalRead(kAsm330SclPin),
+        digitalRead(kAsm330Sa0Pin),
+        (kAsm330CsPin >= 0) ? digitalRead(kAsm330CsPin) : -1);
+  }
 }
 
 bool initAsm330() {
@@ -902,29 +2548,26 @@ bool initAsm330() {
 
   detachInterrupt(digitalPinToInterrupt(kAsm330DrdyPin));
 
-  pinMode(kAsm330DrdyPin, INPUT);
-  if (kAsm330CsPin >= 0) {
-    pinMode(kAsm330CsPin, OUTPUT);
-    digitalWrite(kAsm330CsPin, HIGH);
-  }
-
-  pinMode(kAsm330Sa0Pin, OUTPUT);
-  digitalWrite(kAsm330Sa0Pin, kAsm330Sa0High ? HIGH : LOW);
+  prepareAsm330I2cPins();
   g_asm330I2cAddress = kAsm330Sa0High ? kAsm330I2cAddressHigh : kAsm330I2cAddressLow;
   g_asm330Sensor = kAsm330Sa0High ? &asm330SensorHigh : &asm330SensorLow;
 
   imuI2c.begin(kAsm330SdaPin, kAsm330SclPin, kAsm330I2cHz);
   imuI2c.setTimeOut(20);
   delay(10);
+  printAsm330I2cScan("BOOT,ASM330,I2C_SCAN");
 
   Serial.printf(
-      "BOOT,ASM330,CFG,SDA=%d,SCL=%d,SA0_PIN=%d,SA0_LEVEL=%d,ADDR=0x%02X,CS=%d,DRDY=%d,I2C_HZ=%lu\n",
+      "BOOT,ASM330,CFG,SDA=%d,SCL=%d,SA0_PIN=%d,SA0_LEVEL=%d,ADDR=0x%02X,CS=%d,CS_LEVEL=%d,SDA_LEVEL=%d,SCL_LEVEL=%d,DRDY=%d,I2C_HZ=%lu\n",
       kAsm330SdaPin,
       kAsm330SclPin,
       kAsm330Sa0Pin,
       kAsm330Sa0High ? 1 : 0,
       g_asm330I2cAddress,
       kAsm330CsPin,
+      (kAsm330CsPin >= 0) ? digitalRead(kAsm330CsPin) : -1,
+      digitalRead(kAsm330SdaPin),
+      digitalRead(kAsm330SclPin),
       kAsm330DrdyPin,
       static_cast<unsigned long>(kAsm330I2cHz));
 
@@ -942,6 +2585,7 @@ bool initAsm330() {
   if (whoAmI != kAsm330WhoAmIValue) {
     g_asm330InitFailureCount++;
     Serial.printf("BOOT,ASM330,ERR,WHOAMI,0x%02X\n", whoAmI);
+    printAsm330I2cScan("BOOT,ASM330,I2C_SCAN_FAIL");
     printAsm330KeyRegisters("BOOT,ASM330,REGS_FAIL");
     printAsm330InitState("ASM330,INIT,STATE");
     return false;
@@ -955,6 +2599,17 @@ bool initAsm330() {
     return false;
   }
 
+  g_asm330LastCtrl4C = asm330ReadRegister(kAsm330RegCtrl4C);
+  Serial.printf("BOOT,ASM330,CTRL4_AFTER_RESET,0x%02X\n", g_asm330LastCtrl4C);
+  if ((g_asm330LastCtrl4C & kAsm330Ctrl4CI2cDisable) != 0U) {
+    g_asm330InitFailureCount++;
+    Serial.printf("BOOT,ASM330,ERR,I2C_DISABLED,CTRL4_C=0x%02X\n", g_asm330LastCtrl4C);
+    printAsm330I2cScan("BOOT,ASM330,I2C_SCAN_DISABLED");
+    printAsm330KeyRegisters("BOOT,ASM330,REGS_I2C_DISABLED");
+    printAsm330InitState("ASM330,INIT,STATE");
+    return false;
+  }
+
   if (g_asm330Sensor->begin() != ASM330LHH_OK ||
       g_asm330Sensor->Set_X_FS(kAsm330TargetAccelRangeG) != ASM330LHH_OK ||
       g_asm330Sensor->Set_G_FS(kAsm330TargetGyroRangeDps) != ASM330LHH_OK ||
@@ -962,7 +2617,6 @@ bool initAsm330() {
       g_asm330Sensor->Set_G_ODR(kAsm330TargetOdrHz) != ASM330LHH_OK ||
       g_asm330Sensor->Enable_X() != ASM330LHH_OK ||
       g_asm330Sensor->Enable_G() != ASM330LHH_OK ||
-      !asm330UpdateRegisterBits(kAsm330RegCtrl4C, kAsm330Ctrl4CI2cDisable, kAsm330Ctrl4CI2cEnable) ||
       !asm330WriteRegisterChecked(kAsm330RegInt1Ctrl, kAsm330Int1DataReady)) {
     g_asm330InitFailureCount++;
     Serial.println("BOOT,ASM330,ERR,DRIVER_INIT_FAIL");
@@ -1056,41 +2710,40 @@ bool initTwai() {
   return true;
 }
 
-bool configureMcp2515Profile(const size_t candidateIndex, const char *prefix) {
-  if (candidateIndex >= (sizeof(kMcp2515ClockCandidates) / sizeof(kMcp2515ClockCandidates[0]))) {
-    return false;
-  }
-
-  const Mcp2515BitTimingProfile &candidate = kMcp2515ClockCandidates[candidateIndex];
-  if (mcp2515.initialize(candidate) != Mcp2515Driver::Error::Ok) {
-    return false;
-  }
-
-  g_mcpClockCandidateIndex = candidateIndex;
-  g_mcpClockLabel = candidate.label;
-  g_lastMcpProfileSwitchMs = millis();
-  Serial.printf(
-      "%s,CLOCK=%s,CNF=%02X/%02X/%02X\n",
-      prefix,
-      g_mcpClockLabel,
-      candidate.cnf1,
-      candidate.cnf2,
-      candidate.cnf3);
-  return true;
-}
-
 bool initMcp2515() {
   pinMode(kSdCsPin, OUTPUT);
   digitalWrite(kSdCsPin, HIGH);
 
-  mcp2515.begin(kMcp2515SckPin, kMcp2515MisoPin, kMcp2515MosiPin);
+  pinMode(kMcp2515CsPin, OUTPUT);
+  digitalWrite(kMcp2515CsPin, HIGH);
+  pinMode(kMcp2515IntPin, INPUT_PULLUP);
 
-  if (!configureMcp2515Profile(kMcp2515DefaultClockCandidateIndex, "BOOT,MCP2515,CFG")) {
-    Serial.println("BOOT,MCP2515,ERR,INIT");
+  canSpi.begin(kMcp2515SckPin, kMcp2515MisoPin, kMcp2515MosiPin, kMcp2515CsPin);
+
+  if (!takeMcpBus()) {
+    Serial.println("BOOT,MCP2515,ERR,MUTEX");
     return false;
   }
 
-  Serial.printf("BOOT,MCP2515,OK,500KBPS,OSC=%s,NORMAL,RX_POLL\n", g_mcpClockLabel);
+  const uint8_t beginResult = mcp2515.begin(MCP_ANY, CAN_500KBPS, MCP_10MHZ);
+  const uint8_t oneShotResult = (beginResult == CAN_OK) ? mcp2515.disOneShotTX() : CAN_FAILINIT;
+  const uint8_t modeResult = (beginResult == CAN_OK) ? mcp2515.setMode(MCP_NORMAL) : CAN_FAILINIT;
+  giveMcpBus();
+
+  if (beginResult != CAN_OK || oneShotResult != CAN_OK || modeResult != CAN_OK) {
+    Serial.printf(
+        "BOOT,MCP2515,ERR,INIT,BEGIN=%u,ONESHOT=%u,MODE=%u\n",
+        static_cast<unsigned int>(beginResult),
+        static_cast<unsigned int>(oneShotResult),
+        static_cast<unsigned int>(modeResult));
+    return false;
+  }
+
+  g_mcpClockLabel = "10MHZ";
+  g_lastMcpProfileSwitchMs = millis();
+  attachInterrupt(digitalPinToInterrupt(kMcp2515IntPin), onMcp2515Interrupt, FALLING);
+  Serial.printf("BOOT,MCP2515,CFG,CLOCK=%s,INT_PIN=%d,PULLUP=1\n", g_mcpClockLabel, kMcp2515IntPin);
+  Serial.printf("BOOT,MCP2515,OK,500KBPS,OSC=%s,NORMAL,RX_INT\n", g_mcpClockLabel);
   return true;
 }
 
@@ -1111,13 +2764,27 @@ void serviceMcpStatus() {
   }
 
   g_lastMcpStatusMs = nowMs;
+
+  uint8_t errorFlags = g_mcpLastErrorFlags;
+  uint8_t txErrorCount = 0;
+  uint8_t rxErrorCount = 0;
+  uint8_t rxPending = 0;
+  if (takeMcpBus()) {
+    errorFlags = mcp2515.getError();
+    txErrorCount = mcp2515.errorCountTX();
+    rxErrorCount = mcp2515.errorCountRX();
+    rxPending = mcp2515.checkReceive() == CAN_MSGAVAIL ? 1U : 0U;
+    giveMcpBus();
+    g_mcpLastErrorFlags = errorFlags;
+  }
+
   Serial.printf(
-      "MCP2515,STATE,MODE=0x%02X,EFLG=0x%02X,CANINTF=0x%02X,TEC=%u,REC=%u,RX_FRAMES=%lu,QUEUE_DROP=%lu,OSC=%s\n",
-      mcp2515.getOperatingMode(),
-      mcp2515.getErrorFlags(),
-      mcp2515.getInterruptFlags(),
-      mcp2515.getTransmitErrorCount(),
-      mcp2515.getReceiveErrorCount(),
+      "MCP2515,STATE,INT=%u,PENDING=%u,EFLG=0x%02X,TEC=%u,REC=%u,RX_FRAMES=%lu,QUEUE_DROP=%lu,OSC=%s\n",
+      digitalRead(kMcp2515IntPin) == LOW ? 1U : 0U,
+      rxPending,
+      errorFlags,
+      txErrorCount,
+      rxErrorCount,
       static_cast<unsigned long>(g_mcpRxFrameCount),
       static_cast<unsigned long>(g_mcpQueueDropCount),
       g_mcpClockLabel);
@@ -1148,7 +2815,7 @@ void serviceMcpErrorReport() {
   if (readErrorCount != g_reportedMcpRxReadErrorCount) {
     g_reportedMcpRxReadErrorCount = readErrorCount;
     Serial.printf(
-        "MCP2515,ERR,RX_READ,EFLG=0x%02X,CANINTF=0x%02X,COUNT=%lu\n",
+      "MCP2515,ERR,RX_READ,EFLG=0x%02X,STATUS=0x%02X,COUNT=%lu\n",
         static_cast<uint8_t>(g_mcpLastReadErrEflg),
         static_cast<uint8_t>(g_mcpLastReadErrCanintf),
         static_cast<unsigned long>(readErrorCount));
@@ -1177,17 +2844,88 @@ bool initSdCard() {
   digitalWrite(kSdCsPin, HIGH);
   giveCanSpiMutex();
   if (!started) {
+    g_sdCardPresent = false;
+    g_sdReadOk = false;
+    g_sdWriteOk = false;
     Serial.println("SD,ERR,INIT");
     return false;
   }
 
   if (SD.cardType() == CARD_NONE) {
+    g_sdCardPresent = false;
+    g_sdReadOk = false;
+    g_sdWriteOk = false;
     Serial.println("SD,ERR,NO_CARD");
     return false;
   }
 
+  g_sdCardPresent = true;
+  if (!runSdQuickProbe()) {
+    Serial.println("SD,ERR,PROBE");
+    return false;
+  }
   Serial.println("SD,OK");
   return true;
+}
+
+void serviceSdHealthCheck() {
+  const uint32_t nowMs = millis();
+  if ((nowMs - g_lastSdHealthCheckMs) < kSdHealthCheckPeriodMs) {
+    return;
+  }
+  g_lastSdHealthCheckMs = nowMs;
+
+  // Fast path when we already know a card is present: just verify it is still visible.
+  if (g_sdCardPresent) {
+    if (!takeCanSpiMutex()) {
+      return;
+    }
+
+    digitalWrite(kMcp2515CsPin, HIGH);
+    const bool stillPresent = SD.cardType() != CARD_NONE;
+    giveCanSpiMutex();
+
+    if (!stillPresent) {
+      Serial.println("SD,CARD,REMOVED");
+      g_sdCardPresent = false;
+      g_sdReady = false;
+      g_sdError = true;
+      g_sdReadOk = false;
+      g_sdWriteOk = false;
+      g_recordingRequested = false;
+      closeLogFile();
+      printSdState("SD,STATE");
+      return;
+    }
+
+    // Recover readiness if we had a previous SD error while card remains inserted.
+    if (!g_sdReady || !g_sdReadOk || !g_sdWriteOk) {
+      g_sdReady = runSdQuickProbe();
+      g_sdError = !g_sdReady;
+      printSdState("SD,STATE");
+    }
+    return;
+  }
+
+  // Slow path for insertion detection when no card is currently present.
+  if (!takeCanSpiMutex()) {
+    return;
+  }
+
+  digitalWrite(kMcp2515CsPin, HIGH);
+  const bool started = SD.begin(kSdCsPin, canSpi);
+  const bool cardPresentNow = started && (SD.cardType() != CARD_NONE);
+  giveCanSpiMutex();
+
+  if (!cardPresentNow) {
+    return;
+  }
+
+  Serial.println("SD,CARD,INSERTED");
+  g_sdCardPresent = true;
+  g_sdReady = runSdQuickProbe();
+  g_sdError = !g_sdReady;
+  printSdState("SD,STATE");
 }
 
 void serviceRecordButton() {
@@ -1212,20 +2950,30 @@ void serviceRecordButton() {
     return;
   }
 
-  g_recordingRequested = !g_recordingRequested;
-  Serial.printf("SD,RECORD,%s\n", g_recordingRequested ? "ON" : "OFF");
-
-  if (!g_recordingRequested) {
+  const bool enableRecording = !g_recordingRequested;
+  if (!enableRecording) {
+    g_recordingRequested = false;
+    Serial.println("SD,RECORD,OFF,SRC=GPIO");
     closeLogFile();
+    printSdState("SD,STATE");
     return;
   }
+
+  g_recordingRequested = true;
+  Serial.println("SD,RECORD,ON,SRC=GPIO");
 
   if (!g_sdReady || g_sdError) {
     Serial.println("SD,RECORD,REJECTED");
+    g_recordingRequested = false;
+    printSdState("SD,STATE");
     return;
   }
 
-  openLogFile();
+  if (!static_cast<bool>(g_logFile) && !openLogFile()) {
+    Serial.println("SD,RECORD,REJECTED");
+    g_recordingRequested = false;
+  }
+  printSdState("SD,STATE");
 }
 
 void serviceRecordingState() {
@@ -1237,7 +2985,11 @@ void serviceRecordingState() {
     return;
   }
 
-  openLogFile();
+  if (!openLogFile()) {
+    g_recordingRequested = false;
+    Serial.println("SD,RECORD,REJECTED");
+    printSdState("SD,STATE");
+  }
 }
 
 bool readAsm330Sample(ImuSample &sample) {
@@ -1335,6 +3087,7 @@ void serviceAsm330Debug() {
   printAsm330DebugSnapshot("ASMDBG");
 
   if ((g_asm330SampleCount == 0U) || (g_asm330ConsecutiveNoSampleCount > 2000U) || (g_asm330AllZeroSampleCount > 0U)) {
+    printAsm330I2cScan("ASMDBG,I2C_SCAN");
     printAsm330KeyRegisters("ASMDBG,REGS");
   }
 }
@@ -1346,12 +3099,14 @@ void setSdRecordingFromSerial(const bool enable) {
 
     if (!g_sdReady || g_sdError) {
       Serial.println("SD,RECORD,REJECTED");
+      g_recordingRequested = false;
       printSdState("SD,STATE");
       return;
     }
 
-    if (!static_cast<bool>(g_logFile)) {
-      openLogFile();
+    if (!static_cast<bool>(g_logFile) && !openLogFile()) {
+      Serial.println("SD,RECORD,REJECTED");
+      g_recordingRequested = false;
     }
 
     printSdState("SD,STATE");
@@ -1392,6 +3147,240 @@ bool handleSdSerialCommand(const char *line) {
 
   if (strncmp(line, "SD", 2) == 0) {
     Serial.printf("SD,ERR,UNKNOWN_CMD,%s\n", line);
+    return true;
+  }
+
+  return false;
+}
+
+bool handleModemSerialCommand(const char *line) {
+  if (strcmp(line, "MODEMSTATE") == 0) {
+    printModemState("MODEM,STATE");
+    printNtripState("NTRIP,STATE");
+    printMqttState("MQTT,STATE");
+    return true;
+  }
+
+  if (strcmp(line, "MQTTSTATE") == 0) {
+    printMqttState("MQTT,STATE");
+    return true;
+  }
+
+  if (strcmp(line, "MQTTON") == 0) {
+    g_mqttEnableRequested = true;
+    Serial.println("MQTT,CMD,ON");
+    return true;
+  }
+
+  if (strcmp(line, "MQTTOFF") == 0) {
+    g_mqttDisableRequested = true;
+    Serial.println("MQTT,CMD,OFF");
+    return true;
+  }
+
+  if (strcmp(line, "MODEMCONNECT") == 0) {
+    g_modemConnectRequested = true;
+    Serial.println("MODEM,CMD,CONNECT");
+    return true;
+  }
+
+  if (strcmp(line, "MODEMDISCONNECT") == 0) {
+    g_modemDisconnectRequested = true;
+    Serial.println("MODEM,CMD,DISCONNECT");
+    return true;
+  }
+
+  if (strcmp(line, "MODEMPWRKEY") == 0) {
+    g_modemPowerKeyRequested = true;
+    Serial.println("MODEM,CMD,PWRKEY");
+    return true;
+  }
+
+  if (strcmp(line, "MODEMRESET") == 0) {
+    g_modemResetRequested = true;
+    Serial.println("MODEM,CMD,RESET");
+    return true;
+  }
+
+  if (strncmp(line, "MODEMAPN,", 9) == 0) {
+    char buffer[kSerialCommandBufferSize] = {};
+    strncpy(buffer, line + 9, sizeof(buffer) - 1U);
+    char *savePtr = nullptr;
+    char *apn = strtok_r(buffer, ",", &savePtr);
+    char *user = strtok_r(nullptr, ",", &savePtr);
+    char *pass = strtok_r(nullptr, "", &savePtr);
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      copyText(g_cellularState.apn, sizeof(g_cellularState.apn), apn == nullptr ? "" : apn);
+      copyText(g_cellularState.apnUser, sizeof(g_cellularState.apnUser), user == nullptr ? "" : user);
+      copyText(g_cellularState.apnPass, sizeof(g_cellularState.apnPass), pass == nullptr ? "" : pass);
+      giveMutex(g_cellularStateMutex);
+    }
+    Serial.println("MODEM,CMD,APN_SET");
+    printModemState("MODEM,STATE");
+    return true;
+  }
+
+  if (strncmp(line, "MODEMHTTP,", 10) == 0) {
+    char buffer[kSerialCommandBufferSize] = {};
+    strncpy(buffer, line + 10, sizeof(buffer) - 1U);
+    char *savePtr = nullptr;
+    char *host = strtok_r(buffer, ",", &savePtr);
+    char *path = strtok_r(nullptr, "", &savePtr);
+    if (host == nullptr) {
+      Serial.println("MODEM,ERR,HTTP_ARGS");
+      return true;
+    }
+
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      copyText(g_cellularState.httpHost, sizeof(g_cellularState.httpHost), host);
+      copyText(g_cellularState.httpPath, sizeof(g_cellularState.httpPath), (path == nullptr || path[0] == '\0') ? "/" : path);
+      giveMutex(g_cellularStateMutex);
+    }
+    g_modemHttpTestRequested = true;
+    Serial.println("MODEM,CMD,HTTP_TEST");
+    return true;
+  }
+
+  if (strncmp(line, "MQTTCFG,", 8) == 0) {
+    char buffer[kSerialCommandBufferSize] = {};
+    strncpy(buffer, line + 8, sizeof(buffer) - 1U);
+    char *savePtr = nullptr;
+    char *host = strtok_r(buffer, ",", &savePtr);
+    char *port = strtok_r(nullptr, ",", &savePtr);
+    char *clientId = strtok_r(nullptr, ",", &savePtr);
+    char *topicPrefix = strtok_r(nullptr, "", &savePtr);
+    if (host == nullptr || port == nullptr || clientId == nullptr || topicPrefix == nullptr) {
+      Serial.println("MQTT,ERR,CFG_ARGS");
+      return true;
+    }
+
+    const unsigned long parsedPort = strtoul(port, nullptr, 10);
+    if (parsedPort == 0UL || parsedPort > 65535UL) {
+      Serial.println("MQTT,ERR,CFG_PORT");
+      return true;
+    }
+
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      copyText(g_cellularState.mqttHost, sizeof(g_cellularState.mqttHost), host);
+      g_cellularState.mqttPort = static_cast<uint16_t>(parsedPort);
+      copyText(g_cellularState.mqttClientId, sizeof(g_cellularState.mqttClientId), clientId);
+      copyText(g_cellularState.mqttTopicPrefix, sizeof(g_cellularState.mqttTopicPrefix), topicPrefix);
+      g_cellularState.mqttConfigured = true;
+      copyText(g_cellularState.lastMqttEvent, sizeof(g_cellularState.lastMqttEvent), "CFG_SET");
+      copyText(g_cellularState.lastMqttError, sizeof(g_cellularState.lastMqttError), "-");
+      giveMutex(g_cellularStateMutex);
+    }
+
+    Serial.println("MQTT,CMD,CFG_SET");
+    printMqttState("MQTT,STATE");
+    return true;
+  }
+
+  if (strncmp(line, "MQTTAUTH,", 9) == 0) {
+    char buffer[kSerialCommandBufferSize] = {};
+    strncpy(buffer, line + 9, sizeof(buffer) - 1U);
+    char *savePtr = nullptr;
+    char *user = strtok_r(buffer, ",", &savePtr);
+    char *pass = strtok_r(nullptr, "", &savePtr);
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      copyText(g_cellularState.mqttUser, sizeof(g_cellularState.mqttUser), (user == nullptr || strcmp(user, "-") == 0) ? "" : user);
+      copyText(g_cellularState.mqttPass, sizeof(g_cellularState.mqttPass), (pass == nullptr || strcmp(pass, "-") == 0) ? "" : pass);
+      copyText(g_cellularState.lastMqttEvent, sizeof(g_cellularState.lastMqttEvent), "AUTH_SET");
+      copyText(g_cellularState.lastMqttError, sizeof(g_cellularState.lastMqttError), "-");
+      giveMutex(g_cellularStateMutex);
+    }
+
+    Serial.println("MQTT,CMD,AUTH_SET");
+    printMqttState("MQTT,STATE");
+    return true;
+  }
+
+  if (strcmp(line, "MODEMHELP") == 0) {
+    Serial.println("MODEM,CMD,MODEMSTATE|MODEMCONNECT|MODEMDISCONNECT|MODEMPWRKEY|MODEMRESET|MODEMAPN,<apn>,<user>,<pass>|MODEMHTTP,<host>,<path>|MQTTSTATE|MQTTON|MQTTOFF|MQTTCFG,<host>,<port>,<client>,<prefix>|MQTTAUTH,<user>,<pass>");
+    return true;
+  }
+
+  if (strncmp(line, "MODEM", 5) == 0 || strncmp(line, "MQTT", 4) == 0) {
+    Serial.printf("MODEM,ERR,UNKNOWN_CMD,%s\n", line);
+    return true;
+  }
+
+  return false;
+}
+
+bool handleGnssSerialCommand(const char *line) {
+  if (strcmp(line, "GNSSSTATE") == 0) {
+    printGnssState("GNSS,STATE");
+    return true;
+  }
+
+  if (strcmp(line, "GNSSRESET") == 0) {
+    requestGnssHardwareReset();
+    Serial.println("GNSS,CMD,RESET");
+    return true;
+  }
+
+  if (strncmp(line, "NTRIPCFG,", 9) == 0) {
+    char buffer[kSerialCommandBufferSize] = {};
+    strncpy(buffer, line + 9, sizeof(buffer) - 1U);
+    char *savePtr = nullptr;
+    char *host = strtok_r(buffer, ",", &savePtr);
+    char *port = strtok_r(nullptr, ",", &savePtr);
+    char *mount = strtok_r(nullptr, ",", &savePtr);
+    char *user = strtok_r(nullptr, ",", &savePtr);
+    char *pass = strtok_r(nullptr, "", &savePtr);
+    if (host == nullptr || port == nullptr || mount == nullptr) {
+      Serial.println("NTRIP,ERR,CFG_ARGS");
+      return true;
+    }
+
+    const unsigned long parsedPort = strtoul(port, nullptr, 10);
+    if (parsedPort == 0UL || parsedPort > 65535UL) {
+      Serial.println("NTRIP,ERR,CFG_PORT");
+      return true;
+    }
+
+    if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+      copyText(g_cellularState.ntripHost, sizeof(g_cellularState.ntripHost), host);
+      copyText(g_cellularState.ntripMount, sizeof(g_cellularState.ntripMount), mount);
+      copyText(g_cellularState.ntripUser, sizeof(g_cellularState.ntripUser), user == nullptr ? "" : user);
+      copyText(g_cellularState.ntripPass, sizeof(g_cellularState.ntripPass), pass == nullptr ? "" : pass);
+      g_cellularState.ntripPort = static_cast<uint16_t>(parsedPort);
+      g_cellularState.ntripConfigured = true;
+      copyText(g_cellularState.lastNtripEvent, sizeof(g_cellularState.lastNtripEvent), "CFG_SET");
+      copyText(g_cellularState.lastNtripError, sizeof(g_cellularState.lastNtripError), "-");
+      giveMutex(g_cellularStateMutex);
+    }
+
+    Serial.println("NTRIP,CMD,CFG_SET");
+    printNtripState("NTRIP,STATE");
+    return true;
+  }
+
+  if (strcmp(line, "NTRIPON") == 0) {
+    g_ntripEnableRequested = true;
+    Serial.println("NTRIP,CMD,ON");
+    return true;
+  }
+
+  if (strcmp(line, "NTRIPOFF") == 0) {
+    g_ntripDisableRequested = true;
+    Serial.println("NTRIP,CMD,OFF");
+    return true;
+  }
+
+  if (strcmp(line, "NTRIPSTATE") == 0) {
+    printNtripState("NTRIP,STATE");
+    return true;
+  }
+
+  if (strcmp(line, "GNSSHELP") == 0) {
+    Serial.println("GNSS,CMD,GNSSSTATE|GNSSRESET|NTRIPCFG,<host>,<port>,<mount>,<user>,<pass>|NTRIPON|NTRIPOFF|NTRIPSTATE");
+    return true;
+  }
+
+  if (strncmp(line, "GNSS", 4) == 0 || strncmp(line, "NTRIP", 5) == 0) {
+    Serial.printf("GNSS,ERR,UNKNOWN_CMD,%s\n", line);
     return true;
   }
 
@@ -1457,6 +3446,29 @@ void handleAsm330SerialCommand(const char *line) {
 
 void handleTxSerialCommand(const char *line);
 
+bool dispatchControlCommand(const char *line) {
+  if (line == nullptr || line[0] == '\0') {
+    return false;
+  }
+
+  if (strncmp(line, "TX,", 3) == 0) {
+    handleTxSerialCommand(line);
+    return true;
+  }
+
+  if (handleSdSerialCommand(line) || handleModemSerialCommand(line) || handleGnssSerialCommand(line)) {
+    return true;
+  }
+
+  if (strncmp(line, "ASM", 3) == 0) {
+    handleAsm330SerialCommand(line);
+    return true;
+  }
+
+  Serial.printf("CMD,ERR,UNKNOWN_CMD,%s\n", line);
+  return false;
+}
+
 void serviceSerialCommands() {
   while (Serial.available() > 0) {
     const char ch = static_cast<char>(Serial.read());
@@ -1466,13 +3478,7 @@ void serviceSerialCommands() {
       }
 
       g_serialCommandBuffer[g_serialCommandLength] = '\0';
-      if (strncmp(g_serialCommandBuffer, "TX,", 3) == 0) {
-        handleTxSerialCommand(g_serialCommandBuffer);
-      } else if (handleSdSerialCommand(g_serialCommandBuffer)) {
-        // SD command was handled.
-      } else {
-        handleAsm330SerialCommand(g_serialCommandBuffer);
-      }
+      dispatchControlCommand(g_serialCommandBuffer);
       g_serialCommandLength = 0U;
       continue;
     }
@@ -1481,7 +3487,7 @@ void serviceSerialCommands() {
       g_serialCommandBuffer[g_serialCommandLength++] = ch;
     } else {
       g_serialCommandLength = 0U;
-      Serial.println("ASMDBG,ERR,CMD_TOO_LONG");
+      Serial.println("CMD,ERR,CMD_TOO_LONG");
     }
   }
 }
@@ -1568,15 +3574,20 @@ void printMcpFrame(const can_frame &frame, const uint32_t timestampMs) {
   logLine(line);
 }
 
-void serviceTwaiRx() {
+void serviceTwaiRx(const uint32_t maxFrames) {
   if (!g_twaiReady) {
     return;
   }
 
   twai_message_t message = {};
+  uint32_t drainedCount = 0;
   while (twai_receive(&message, 0) == ESP_OK) {
     ++g_twaiRxFrameCount;
     printTwaiFrame(message);
+    ++drainedCount;
+    if (drainedCount >= maxFrames) {
+      break;
+    }
   }
 }
 
@@ -1613,26 +3624,47 @@ uint32_t serviceMcpRx() {
     return 0;
   }
 
-  const uint8_t errorFlags = mcp2515.getErrorFlags();
-  if ((errorFlags & (kMcp2515EflgRx0Ovr | kMcp2515EflgRx1Ovr)) != 0U) {
-    mcp2515.clearRxOverflow();
-    mcp2515.clearErrorInterrupts();
-    ++g_mcpRxOverrunCount;
-    g_mcpLastOverrunEflg = errorFlags;
-  }
-
   can_frame frame = {};
   uint32_t drainedCount = 0;
   while (true) {
-    const Mcp2515Driver::Error result = mcp2515.readMessage(&frame);
-    if (result != Mcp2515Driver::Error::Ok) {
-      if (result == Mcp2515Driver::Error::Fail) {
-        ++g_mcpRxReadErrorCount;
-        g_mcpLastReadErrEflg = mcp2515.getErrorFlags();
-        g_mcpLastReadErrCanintf = mcp2515.getInterruptFlags();
-      }
+    INT32U rawIdentifier = 0;
+    uint8_t extended = 0;
+    uint8_t dlc = 0;
+    uint8_t data[8] = {};
+    uint8_t readStatus = CAN_NOMSG;
+    uint8_t errorFlags = g_mcpLastErrorFlags;
+
+    if (!takeMcpBus()) {
+      ++g_mcpRxReadErrorCount;
+      g_mcpLastReadErrCanintf = 0xFFU;
       break;
     }
+
+    readStatus = mcp2515.readMsgBuf(&rawIdentifier, &extended, &dlc, data);
+    errorFlags = mcp2515.getError();
+    giveMcpBus();
+
+    if ((errorFlags & (MCP_EFLG_RX0OVR | MCP_EFLG_RX1OVR)) != 0U &&
+        (g_mcpLastErrorFlags & (MCP_EFLG_RX0OVR | MCP_EFLG_RX1OVR)) == 0U) {
+      ++g_mcpRxOverrunCount;
+      g_mcpLastOverrunEflg = errorFlags;
+    }
+    g_mcpLastErrorFlags = errorFlags;
+
+    if (readStatus == CAN_NOMSG) {
+      break;
+    }
+
+    if (readStatus != CAN_OK) {
+      ++g_mcpRxReadErrorCount;
+      g_mcpLastReadErrEflg = errorFlags;
+      g_mcpLastReadErrCanintf = readStatus;
+      break;
+    }
+
+    frame.can_id = (extended != 0U) ? ((rawIdentifier & CAN_EFF_MASK) | CAN_EFF_FLAG) : (rawIdentifier & CAN_SFF_MASK);
+    frame.can_dlc = dlc <= CAN_MAX_DLEN ? dlc : CAN_MAX_DLEN;
+    memcpy(frame.data, data, frame.can_dlc);
 
     ++drainedCount;
     ++g_mcpRxFrameCount;
@@ -1640,7 +3672,7 @@ uint32_t serviceMcpRx() {
       QueuedCanFrame queuedFrame = {};
       queuedFrame.frame = frame;
       queuedFrame.timestampMs = millis();
-      if (xQueueSend(g_mcpRxQueue, &queuedFrame, 0) != pdPASS) {
+      if (xQueueSend(g_mcpRxQueue, &queuedFrame, pdMS_TO_TICKS(1)) != pdPASS) {
         ++g_mcpQueueDropCount;
       }
     } else {
@@ -1651,23 +3683,30 @@ uint32_t serviceMcpRx() {
   return drainedCount;
 }
 
-void serviceMcpRxQueue() {
+void serviceMcpRxQueue(const uint32_t maxFrames) {
   if (g_mcpRxQueue == nullptr) {
     return;
   }
 
   QueuedCanFrame queuedFrame = {};
+  uint32_t drainedCount = 0;
   while (xQueueReceive(g_mcpRxQueue, &queuedFrame, 0) == pdTRUE) {
     printMcpFrame(queuedFrame.frame, queuedFrame.timestampMs);
+    ++drainedCount;
+    if (drainedCount >= maxFrames) {
+      break;
+    }
   }
 }
 
 void mcpServiceTask(void *parameter) {
   (void)parameter;
   for (;;) {
-    serviceMcpRx();
-    // Keep polling latency low to avoid MCP RX overruns under bursty traffic.
-    taskYIELD();
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
+    const uint32_t drainedCount = serviceMcpRx();
+    if (drainedCount > 0U || digitalRead(kMcp2515IntPin) == LOW) {
+      taskYIELD();
+    }
   }
 }
 
@@ -1698,19 +3737,25 @@ void sendMcpFrameRaw(const uint32_t identifier, const bool extended, const uint8
     return;
   }
 
-  can_frame frame = {};
   const uint8_t clampedLength = (length <= 8U) ? length : 8U;
-  frame.can_id = extended ? ((identifier & CAN_EFF_MASK) | CAN_EFF_FLAG) : (identifier & CAN_SFF_MASK);
-  frame.can_dlc = clampedLength;
-  memcpy(frame.data, payload, clampedLength);
+  uint8_t sendStatus = CAN_FAIL;
+  uint8_t errorFlags = g_mcpLastErrorFlags;
+  uint8_t txErrorCount = 0;
 
-  const Mcp2515Driver::Error result = mcp2515.sendMessage(&frame);
-  if (result != Mcp2515Driver::Error::Ok && result != Mcp2515Driver::Error::AllTxBusy) {
-    Serial.printf(
-        "ERR,MCP_TX,EFLG=0x%02X,CANINTF=0x%02X,TEC=%u\n",
-        mcp2515.getErrorFlags(),
-        mcp2515.getInterruptFlags(),
-        mcp2515.getTransmitErrorCount());
+  if (!takeMcpBus()) {
+    Serial.println("ERR,MCP_TX,MUTEX");
+    return;
+  }
+
+  sendStatus = mcp2515.sendMsgBuf(identifier, extended ? 1U : 0U, clampedLength, const_cast<uint8_t *>(payload));
+  errorFlags = mcp2515.getError();
+  txErrorCount = mcp2515.errorCountTX();
+  giveMcpBus();
+
+  g_mcpLastErrorFlags = errorFlags;
+
+  if (sendStatus != CAN_OK) {
+    Serial.printf("ERR,MCP_TX,EFLG=0x%02X,STATUS=%u,TEC=%u\n", errorFlags, sendStatus, txErrorCount);
   }
 }
 
@@ -1965,6 +4010,28 @@ void updateLeds() {
   setLed(kRedLedPin, hardStopLatched);
 }
 
+void serviceGnssStatusReport() {
+  const uint32_t nowMs = millis();
+  if ((nowMs - g_lastGnssReportMs) < kGnssReportPeriodMs) {
+    return;
+  }
+
+  g_lastGnssReportMs = nowMs;
+  printGnssState("GNSS,STATE");
+}
+
+void serviceModemStatusReport() {
+  const uint32_t nowMs = millis();
+  if ((nowMs - g_lastModemReportMs) < kModemReportPeriodMs) {
+    return;
+  }
+
+  g_lastModemReportMs = nowMs;
+  printModemState("MODEM,STATE");
+  printNtripState("NTRIP,STATE");
+  printMqttState("MQTT,STATE");
+}
+
 }  // namespace
 
 void setup() {
@@ -1973,15 +4040,36 @@ void setup() {
   pinMode(kRedLedPin, OUTPUT);
   setLed(kGreenLedPin, false);
   setLed(kRedLedPin, false);
+  prepareAsm330I2cPins();
 
   Serial.begin(kSerialBaud);
   delay(500);
 
   Serial.println("BOOT,TELEMETRY,START");
 
+  pinMode(kGnssResetPin, OUTPUT);
+  digitalWrite(kGnssResetPin, HIGH);
+  pinMode(kGnssTimePulsePin, INPUT);
+  pinMode(kModemResetPin, OUTPUT);
+  digitalWrite(kModemResetPin, LOW);
+  pinMode(kModemPwrKeyPin, OUTPUT);
+  digitalWrite(kModemPwrKeyPin, LOW);
+
   g_canSpiMutex = xSemaphoreCreateMutex();
   if (g_canSpiMutex == nullptr) {
     Serial.println("BOOT,ERR,CAN_SPI_MUTEX");
+  }
+
+  g_gnssStateMutex = xSemaphoreCreateMutex();
+  g_cellularStateMutex = xSemaphoreCreateMutex();
+  g_gnssUartMutex = xSemaphoreCreateMutex();
+  if (g_gnssStateMutex == nullptr || g_cellularStateMutex == nullptr || g_gnssUartMutex == nullptr) {
+    Serial.println("BOOT,ERR,MODEM_GNSS_MUTEX");
+  }
+
+  g_sdLogQueue = xQueueCreate(kSdLogQueueDepth, sizeof(SdLogEntry));
+  if (g_sdLogQueue == nullptr) {
+    Serial.println("BOOT,ERR,SD_LOG_QUEUE");
   }
 
   g_twaiReady = initTwai();
@@ -2018,9 +4106,33 @@ void setup() {
             kMcpServiceTaskCore) != pdPASS) {
       Serial.println("BOOT,MCP2515,ERR,TASK");
       g_mcpServiceTaskHandle = nullptr;
-          vQueueDelete(g_mcpRxQueue);
-          g_mcpRxQueue = nullptr;
+    vQueueDelete(g_mcpRxQueue);
+    g_mcpRxQueue = nullptr;
     }
+  }
+
+  if (xTaskCreatePinnedToCore(
+          gnssServiceTask,
+          "gnss-service",
+          kGnssTaskStack,
+          nullptr,
+          kGnssTaskPriority,
+          &g_gnssTaskHandle,
+          kGnssTaskCore) != pdPASS) {
+    Serial.println("BOOT,GNSS,ERR,TASK");
+    g_gnssTaskHandle = nullptr;
+  }
+
+  if (xTaskCreatePinnedToCore(
+          modemServiceTask,
+          "modem-service",
+          kModemTaskStack,
+          nullptr,
+          kModemTaskPriority,
+          &g_modemTaskHandle,
+          kModemTaskCore) != pdPASS) {
+    Serial.println("BOOT,MODEM,ERR,TASK");
+    g_modemTaskHandle = nullptr;
   }
 
   if (g_recordingRequested && g_sdReady && !g_sdError) {
@@ -2039,14 +4151,20 @@ void loop() {
   serviceRecordButton();
   serviceRecordingState();
   updateLeds();
-  serviceMcpRxQueue();
-  serviceTwaiRx();
-  serviceMcpRxQueue();
+  serviceGnssStatusReport();
+  serviceModemStatusReport();
+  serviceMcpRxQueue(kMcpQueueDrainBudgetPerLoop);
+  serviceTwaiRx(kTwaiRxBudgetPerLoop);
+  serviceMcpRxQueue(kMcpQueueDrainBudgetPerLoop);
   serviceTwaiStatus();
   if (g_mcpServiceTaskHandle == nullptr) {
     serviceMcpRx();
   }
-  serviceMcpRxQueue();
+  serviceMcpRxQueue(kMcpQueueDrainBudgetPerLoop);
+  serviceSdHealthCheck();
+  serviceSdLogWriter();
+  serviceSerialCommands();
+  serviceRecordButton();
   serviceMcpErrorReport();
   serviceMcpStatus();
   serviceMcpRecovery();
@@ -2061,4 +4179,6 @@ void loop() {
       publishImuToCan(sample);
     }
   }
+
+  delay(1);
 }
