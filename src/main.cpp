@@ -25,7 +25,7 @@
 
 namespace {
 
-constexpr uint32_t kSerialBaud = 921600;
+constexpr uint32_t kSerialBaud = 2000000;
 constexpr uint32_t kHeartbeatHalfPeriodMs = 25;
 constexpr uint32_t kSdErrorHalfPeriodMs = 250;
 constexpr uint32_t kAsm330DebugPeriodMs = 1000;
@@ -49,7 +49,7 @@ constexpr int kAsm330DrdyPin = 45;
 constexpr int kAsm330CsPin = 35;  // bodge wire: was GND, now IO35
 constexpr bool kAsm330Sa0High = false;
 constexpr uint32_t kAsm330I2cHz = 100000;
-constexpr bool kEnableAsm330Runtime = true;
+constexpr bool kEnableAsm330Runtime = false;  // ASM330 disabled – bridge-first operation
 
 constexpr int kSdCsPin = 9;
 constexpr int kMcp2515CsPin = 10;
@@ -71,15 +71,15 @@ constexpr uint32_t kMcp2515SpiHz = 4000000;
 constexpr uint32_t kMcp2515StatusPeriodMs = 1000;
 constexpr bool kMcp2515EnableClockRecovery = false;
 constexpr uint32_t kMcpServiceTaskStack = 4096;
-constexpr UBaseType_t kMcpServiceTaskPriority = 1;
+constexpr UBaseType_t kMcpServiceTaskPriority = 4;
 constexpr BaseType_t kMcpServiceTaskCore = 0;
-constexpr size_t kMcpRxQueueDepth = 1024;
+constexpr size_t kMcpRxQueueDepth = 2048;
 constexpr uint32_t kMcpErrorReportPeriodMs = 250;
 constexpr uint32_t kTwaiRxBudgetPerLoop = 64;
 constexpr uint32_t kMcpQueueDrainBudgetPerLoop = 128;
-constexpr uint32_t kSdHealthCheckPeriodMs = 5000;
+constexpr uint32_t kSdHealthCheckPeriodMs = 30000;
 constexpr size_t kSdLogQueueDepth = 512;
-constexpr uint32_t kSdLogWriteBudgetPerLoop = 16;
+constexpr uint32_t kSdLogWriteBudgetPerLoop = 4;
 constexpr uint32_t kGnssTargetUartBaud = 921600;
 constexpr uint32_t kGnssUartBaudCandidates[] = {kGnssTargetUartBaud, 460800, 115200, 38400, 9600};
 constexpr uint32_t kGnssNavigationFrequencyHz = 2;
@@ -91,14 +91,16 @@ constexpr uint32_t kModemStandardUartBaud = 115200;
 constexpr uint32_t kModemTargetUartBaud = 921600;
 constexpr uint32_t kModemUartBaudCandidates[] = {kModemStandardUartBaud, kModemTargetUartBaud, 460800};
 constexpr uint32_t kModemPowerKeyAssertMs = 500;
-constexpr uint32_t kModemPowerKeyBootWaitMs = 12000;
-constexpr uint32_t kModemPowerKeyBootMaxMs = 16000;
+constexpr uint32_t kModemPowerKeyBootWaitMs = 14000;
+constexpr uint32_t kModemPowerKeyBootMaxMs = 18000;
 constexpr uint32_t kModemAtProbeTimeoutMs = 750;
 constexpr uint32_t kModemReadyProbePeriodMs = 2000;
 constexpr uint32_t kModemSnapshotPeriodMs = 1000;
 constexpr uint32_t kModemRecoveryRetryMs = 1500;
 constexpr uint32_t kModemReportPeriodMs = 1500;
-constexpr uint32_t kModemTaskStack = 8192;
+constexpr bool kModemUseHardwareFlowControl = true;
+constexpr bool kModemAutoPowerKeyOnBoot = true;
+constexpr uint32_t kModemTaskStack = 16384;
 constexpr UBaseType_t kModemTaskPriority = 1;
 constexpr BaseType_t kModemTaskCore = 0;
 constexpr uint32_t kMqttReconnectPeriodMs = 5000;
@@ -211,8 +213,10 @@ struct CellularState {
   bool ntripConfigured = false;
   bool ntripEnabled = false;
   bool ntripConnected = false;
-  bool uartHardwareFlow = true;
+  bool uartHardwareFlow = kModemUseHardwareFlowControl;
   bool uartHighSpeedActive = false;
+  int8_t uartCtsLevel = -1;
+  int8_t uartRtsLevel = -1;
   int signalQuality = -1;
   uint16_t mqttPort = kMqttDefaultPort;
   uint16_t ntripPort = 2101;
@@ -680,6 +684,7 @@ SPIClass canSpi(HSPI);
 HardwareSerial gnssSerial(1);
 HardwareSerial modemSerial(2);
 MCP_CAN mcp2515(&canSpi, kMcp2515CsPin);
+Mcp2515Driver mcp2515Fast(kMcp2515CsPin, kMcp2515SpiHz, &canSpi);
 SFE_UBLOX_GNSS g_gnss;
 TinyGsm g_modem(modemSerial);
 TinyGsmClient g_httpClient(g_modem);
@@ -771,9 +776,11 @@ bool g_sdWriteOk = false;
 uint32_t g_sdLogEnqueueDropCount = 0;
 volatile bool g_modemConnectRequested = false;
 volatile bool g_modemDisconnectRequested = false;
+volatile bool g_modemSetupRequested = false;
 volatile bool g_modemPowerKeyRequested = false;
 volatile bool g_modemResetRequested = false;
 volatile bool g_modemHttpTestRequested = false;
+volatile bool g_bridgeOnlyMode = false;
 volatile bool g_mqttEnableRequested = false;
 volatile bool g_mqttDisableRequested = false;
 volatile bool g_mqttPublishStateRequested = false;
@@ -790,6 +797,10 @@ uint8_t g_modemAtFailureCount = 0;
 bool g_modemInitialized = false;
 bool g_modemHighSpeedConfigured = false;
 bool g_modemPowerKeyBootPending = false;
+bool g_modemFlowControlEnabled = kModemUseHardwareFlowControl;
+bool g_modemBootPowerKeyPending = kModemAutoPowerKeyOnBoot;
+size_t g_modemSyncCandidateIndex = 0;
+bool g_modemSyncFlowFallback = false;
 
 GnssState g_gnssState = {};
 CellularState g_cellularState = {};
@@ -807,7 +818,7 @@ void giveMutex(SemaphoreHandle_t mutex) {
 }
 
 bool takeMcpBus() {
-  if (g_canSpiMutex != nullptr && xSemaphoreTake(g_canSpiMutex, portMAX_DELAY) != pdTRUE) {
+  if (g_canSpiMutex != nullptr && xSemaphoreTake(g_canSpiMutex, 0) != pdTRUE) {
     return false;
   }
 
@@ -1145,7 +1156,7 @@ void serviceSdLogWriter() {
 
     ++g_logLineCount;
     ++writtenCount;
-    if ((g_logLineCount % 32U) == 0U) {
+    if ((g_logLineCount % 128U) == 0U) {
       g_logFile.flush();
     }
   }
@@ -1312,9 +1323,9 @@ void printGnssState(const char *prefix) {
 void printModemState(const char *prefix) {
   const CellularState state = copyCellularState();
   const uint32_t uptimeMs = millis();
-  const bool bootWindowElapsed = uptimeMs >= 12000U;
+  const bool bootWindowElapsed = uptimeMs >= kModemPowerKeyBootWaitMs;
   Serial.printf(
-  "%s,UART=%u,UART_BAUD=%lu,UART_TARGET=%lu,UART_PROBE=%lu,FLOW=%u,HIGH=%u,READY=%u,SIM=%u,NET=%u,GPRS=%u,INTERNET=%u,CSQ=%d,HTTP_CODE=%lu,APN=%s,IP=%s,OP=%s,INFO=%s,BOOT12=%u,UP_MS=%lu,EVENT=%s,ERR=%s\n",
+  "%s,UART=%u,UART_BAUD=%lu,UART_TARGET=%lu,UART_PROBE=%lu,FLOW=%u,HIGH=%u,CTS=%d,RTS=%d,TX_PIN=%d,RX_PIN=%d,READY=%u,SIM=%u,NET=%u,GPRS=%u,INTERNET=%u,CSQ=%d,HTTP_CODE=%lu,APN=%s,IP=%s,OP=%s,INFO=%s,BOOT14=%u,UP_MS=%lu,EVENT=%s,ERR=%s\n",
       prefix,
       state.uartReady ? 1U : 0U,
   static_cast<unsigned long>(state.uartBaud),
@@ -1322,6 +1333,10 @@ void printModemState(const char *prefix) {
   static_cast<unsigned long>(state.uartLastProbeBaud),
   state.uartHardwareFlow ? 1U : 0U,
   state.uartHighSpeedActive ? 1U : 0U,
+      static_cast<int>(state.uartCtsLevel),
+      static_cast<int>(state.uartRtsLevel),
+      kModemEspTxPin,
+      kModemEspRxPin,
       state.modemReady ? 1U : 0U,
       state.simReady ? 1U : 0U,
       state.networkReady ? 1U : 0U,
@@ -1517,25 +1532,35 @@ void gnssServiceTask(void *parameter) {
 }
 
 void updateModemUartState(const uint32_t activeBaud, const uint32_t probeBaud) {
+  const int ctsLevel = digitalRead(kModemCtsPin);
+  const int rtsLevel = digitalRead(kModemRtsPin);
   if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
     g_cellularState.uartReady = true;
     g_cellularState.uartBaud = activeBaud;
     g_cellularState.uartTargetBaud = kModemTargetUartBaud;
     g_cellularState.uartLastProbeBaud = probeBaud;
-    g_cellularState.uartHardwareFlow = true;
+    g_cellularState.uartHardwareFlow = g_modemFlowControlEnabled;
     g_cellularState.uartHighSpeedActive = g_modemHighSpeedConfigured && activeBaud == kModemTargetUartBaud;
+    g_cellularState.uartCtsLevel = static_cast<int8_t>(ctsLevel);
+    g_cellularState.uartRtsLevel = static_cast<int8_t>(rtsLevel);
     giveMutex(g_cellularStateMutex);
   }
 }
 
-void configureModemUart(const uint32_t baudRate = kModemStandardUartBaud) {
+void configureModemUart(const uint32_t baudRate = kModemStandardUartBaud, const bool useFlowControl = kModemUseHardwareFlowControl) {
+  g_modemFlowControlEnabled = useFlowControl;
   modemSerial.end();
   modemSerial.begin(baudRate, SERIAL_8N1, kModemEspRxPin, kModemEspTxPin);
   uart_set_mode(UART_NUM_2, UART_MODE_UART);
-  // ESP32 RTS output must drive the module CTS pin, and ESP32 CTS input
-  // must read the module RTS pin.
-  uart_set_pin(UART_NUM_2, kModemEspTxPin, kModemEspRxPin, kModemCtsPin, kModemRtsPin);
-  uart_set_hw_flow_ctrl(UART_NUM_2, UART_HW_FLOWCTRL_CTS_RTS, 64);
+  if (g_modemFlowControlEnabled) {
+    // ESP32 RTS output must drive the module CTS pin, and ESP32 CTS input
+    // must read the module RTS pin.
+    uart_set_pin(UART_NUM_2, kModemEspTxPin, kModemEspRxPin, kModemCtsPin, kModemRtsPin);
+    uart_set_hw_flow_ctrl(UART_NUM_2, UART_HW_FLOWCTRL_CTS_RTS, 64);
+  } else {
+    uart_set_pin(UART_NUM_2, kModemEspTxPin, kModemEspRxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_set_hw_flow_ctrl(UART_NUM_2, UART_HW_FLOWCTRL_DISABLE, 0);
+  }
   updateModemUartState(baudRate, baudRate);
 }
 
@@ -1551,11 +1576,11 @@ bool promoteModemUartToTarget() {
 
   delay(100);
   g_modemHighSpeedConfigured = true;
-  configureModemUart(kModemTargetUartBaud);
+  configureModemUart(kModemTargetUartBaud, g_modemFlowControlEnabled);
   delay(100);
   if (!g_modem.testAT(kModemAtProbeTimeoutMs)) {
     g_modemHighSpeedConfigured = false;
-    configureModemUart(kModemStandardUartBaud);
+    configureModemUart(kModemStandardUartBaud, g_modemFlowControlEnabled);
     setModemEvent("MODEM_UART_FAIL", "BAUD_SWITCH");
     return false;
   }
@@ -1585,27 +1610,53 @@ void pulseModemResetPin() {
   vTaskDelay(pdMS_TO_TICKS(2500));
 }
 
+bool synchronizeModemUartWithFlow(const bool useFlowControl) {
+  if (g_modemSyncCandidateIndex >= (sizeof(kModemUartBaudCandidates) / sizeof(kModemUartBaudCandidates[0]))) {
+    return false;
+  }
+
+  const uint32_t baudRate = kModemUartBaudCandidates[g_modemSyncCandidateIndex++];
+  configureModemUart(baudRate, useFlowControl);
+  updateModemUartState(baudRate, baudRate);
+  vTaskDelay(pdMS_TO_TICKS(1));
+  delay(100);
+  if (!g_modem.testAT(kModemAtProbeTimeoutMs)) {
+    return false;
+  }
+
+  g_modemHighSpeedConfigured = baudRate == kModemTargetUartBaud;
+  updateModemUartState(baudRate, baudRate);
+
+  if (baudRate != kModemTargetUartBaud && !promoteModemUartToTarget()) {
+    return false;
+  }
+
+  g_modemSyncCandidateIndex = 0;
+  g_modemSyncFlowFallback = false;
+  setModemEvent("MODEM_UART_OK", "-");
+  return true;
+}
+
 bool synchronizeModemUart() {
-  for (size_t index = 0; index < (sizeof(kModemUartBaudCandidates) / sizeof(kModemUartBaudCandidates[0])); ++index) {
-    const uint32_t baudRate = kModemUartBaudCandidates[index];
-    configureModemUart(baudRate);
-    updateModemUartState(baudRate, baudRate);
-    delay(100);
-    if (!g_modem.testAT(kModemAtProbeTimeoutMs)) {
-      continue;
-    }
-
-    g_modemHighSpeedConfigured = baudRate == kModemTargetUartBaud;
-    updateModemUartState(baudRate, baudRate);
-
-    if (baudRate != kModemTargetUartBaud && !promoteModemUartToTarget()) {
-      return false;
-    }
-
-    setModemEvent("MODEM_UART_OK", "-");
+  if (synchronizeModemUartWithFlow(g_modemSyncFlowFallback ? false : kModemUseHardwareFlowControl)) {
     return true;
   }
 
+  if (g_modemSyncCandidateIndex < (sizeof(kModemUartBaudCandidates) / sizeof(kModemUartBaudCandidates[0]))) {
+    setModemEvent("MODEM_UART_SCAN", g_modemSyncFlowFallback ? "FLOW_OFF" : "FLOW_ON");
+    return false;
+  }
+
+  // If CTS/RTS wiring keeps UART blocked, retry without HW flow control.
+  if (kModemUseHardwareFlowControl && !g_modemSyncFlowFallback) {
+    g_modemSyncFlowFallback = true;
+    g_modemSyncCandidateIndex = 0;
+    setModemEvent("MODEM_UART_SCAN", "FLOW_FALLBACK");
+    return false;
+  }
+
+  g_modemSyncCandidateIndex = 0;
+  g_modemSyncFlowFallback = false;
   setModemEvent("MODEM_UART_FAIL", "AT_TIMEOUT");
   return false;
 }
@@ -1635,6 +1686,14 @@ void refreshModemNetworkSnapshot(const bool force = false) {
     giveMutex(g_cellularStateMutex);
   }
   g_lastModemSnapshotMs = nowMs;
+}
+
+bool isModemBootWindowElapsed() {
+  if (!g_modemPowerKeyBootPending) {
+    return true;
+  }
+
+  return (millis() - g_lastModemPowerKeyPulseMs) >= kModemPowerKeyBootWaitMs;
 }
 
 bool ensureModemReady() {
@@ -1678,9 +1737,18 @@ bool ensureModemReady() {
     if (!synchronizeModemUart()) {
       return false;
     }
-    if (g_modem.testAT(kModemAtProbeTimeoutMs)) {
-      g_modemAtFailureCount = 0;
-    } else if (g_modemAtFailureCount == 2U) {
+    g_modemAtFailureCount = 0;
+    if (g_modemPowerKeyBootPending) {
+      setModemEvent("MODEM_BOOT_READY", "AT_OK");
+    }
+  }
+
+  if (g_modemPowerKeyBootPending) {
+    setModemEvent("MODEM_BOOT_READY", "AT_OK");
+  }
+
+  if (!g_modem.testAT(kModemAtProbeTimeoutMs)) {
+    if (g_modemAtFailureCount == 2U) {
       setModemEvent("MODEM_PWRKEY", "AT_TIMEOUT");
       g_modemInitialized = false;
       pulseModemPowerKey();
@@ -1690,10 +1758,10 @@ bool ensureModemReady() {
       pulseModemResetPin();
       g_modemAtFailureCount = 0;
       return false;
-    } else {
-      setModemEvent("MODEM_AT_WAIT", "AT_TIMEOUT");
-      return false;
     }
+
+    setModemEvent("MODEM_AT_WAIT", "AT_TIMEOUT");
+    return false;
   }
 
   CellularState currentState = copyCellularState();
@@ -1705,12 +1773,11 @@ bool ensureModemReady() {
   }
 
   g_modemAtFailureCount = 0;
+  g_modemSyncCandidateIndex = 0;
+  g_modemSyncFlowFallback = false;
 
   if (!g_modemInitialized) {
-    bool initialized = g_modem.init();
-    if (!initialized) {
-      initialized = g_modem.restart();
-    }
+    const bool initialized = g_modem.init();
     if (!initialized) {
       if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
         g_cellularState.modemReady = false;
@@ -2036,13 +2103,17 @@ void publishMqttStateSnapshots() {
   snprintf(
       payload,
       sizeof(payload),
-      "MODEM,STATE,UART=%u,UART_BAUD=%lu,UART_TARGET=%lu,UART_PROBE=%lu,FLOW=%u,HIGH=%u,READY=%u,SIM=%u,NET=%u,GPRS=%u,INTERNET=%u,CSQ=%d,HTTP_CODE=%lu,APN=%s,IP=%s,OP=%s,INFO=%s,BOOT12=%u,UP_MS=%lu,EVENT=%s,ERR=%s",
+      "MODEM,STATE,UART=%u,UART_BAUD=%lu,UART_TARGET=%lu,UART_PROBE=%lu,FLOW=%u,HIGH=%u,CTS=%d,RTS=%d,TX_PIN=%d,RX_PIN=%d,READY=%u,SIM=%u,NET=%u,GPRS=%u,INTERNET=%u,CSQ=%d,HTTP_CODE=%lu,APN=%s,IP=%s,OP=%s,INFO=%s,BOOT14=%u,UP_MS=%lu,EVENT=%s,ERR=%s",
       cellularState.uartReady ? 1U : 0U,
       static_cast<unsigned long>(cellularState.uartBaud),
       static_cast<unsigned long>(cellularState.uartTargetBaud),
       static_cast<unsigned long>(cellularState.uartLastProbeBaud),
       cellularState.uartHardwareFlow ? 1U : 0U,
       cellularState.uartHighSpeedActive ? 1U : 0U,
+      static_cast<int>(cellularState.uartCtsLevel),
+      static_cast<int>(cellularState.uartRtsLevel),
+      kModemEspTxPin,
+      kModemEspRxPin,
       cellularState.modemReady ? 1U : 0U,
       cellularState.simReady ? 1U : 0U,
       cellularState.networkReady ? 1U : 0U,
@@ -2054,7 +2125,7 @@ void publishMqttStateSnapshots() {
       cellularState.ipAddress,
       cellularState.operatorName,
       cellularState.modemInfo,
-      millis() >= 12000U ? 1U : 0U,
+      millis() >= kModemPowerKeyBootWaitMs ? 1U : 0U,
       static_cast<unsigned long>(millis()),
       cellularState.lastModemEvent,
       cellularState.lastModemError);
@@ -2294,7 +2365,10 @@ void serviceMqttLink() {
 }
 
 bool modemServiceNeeded(const CellularState &state) {
-  return g_modemPowerKeyRequested ||
+  return g_modemBootPowerKeyPending ||
+         g_modemPowerKeyBootPending ||
+         g_modemSetupRequested ||
+         g_modemPowerKeyRequested ||
          g_modemResetRequested ||
          g_modemConnectRequested ||
          g_modemDisconnectRequested ||
@@ -2307,7 +2381,7 @@ bool modemServiceNeeded(const CellularState &state) {
 
 void modemServiceTask(void *parameter) {
   (void)parameter;
-  configureModemUart();
+  configureModemUart(kModemStandardUartBaud, kModemUseHardwareFlowControl);
   for (;;) {
     const CellularState state = copyCellularState();
     if (!modemServiceNeeded(state)) {
@@ -2315,9 +2389,20 @@ void modemServiceTask(void *parameter) {
       continue;
     }
 
+    if (g_modemBootPowerKeyPending) {
+      g_modemBootPowerKeyPending = false;
+      // Always issue a controlled startup pulse so modem power-on is deterministic.
+      g_modemInitialized = false;
+      g_modemPowerKeyBootPending = false;
+      pulseModemPowerKey();
+      setModemEvent("MODEM_PWRKEY", "BOOT");
+      continue;
+    }
+
     if (g_modemPowerKeyRequested) {
       g_modemPowerKeyRequested = false;
       g_modemInitialized = false;
+      g_modemPowerKeyBootPending = false;
       pulseModemPowerKey();
       setModemEvent("MODEM_PWRKEY", "MANUAL");
       continue;
@@ -2334,12 +2419,37 @@ void modemServiceTask(void *parameter) {
         giveMutex(g_cellularStateMutex);
       }
       g_modemInitialized = false;
+      g_modemSetupRequested = false;
       setModemEvent("MODEM_RESET", "-");
     }
 
-    if (!ensureModemReady()) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+    const bool needModemSetup = g_modemSetupRequested ||
+                                g_modemConnectRequested ||
+                                g_modemDisconnectRequested ||
+                                g_modemHttpTestRequested ||
+                                state.mqttEnabled ||
+                                state.ntripEnabled ||
+                                state.gprsReady ||
+                                state.modemReady;
+    if (!needModemSetup) {
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
+    }
+
+    if (!isModemBootWindowElapsed()) {
+      setModemEvent("MODEM_BOOT_WAIT", "SETUP_GATED");
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
+    if (!ensureModemReady()) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
+    if (g_modemSetupRequested) {
+      g_modemSetupRequested = false;
+      setModemEvent("MODEM_SETUP_OK", "-");
     }
 
     if (g_modemDisconnectRequested) {
@@ -2521,6 +2631,13 @@ void prepareAsm330I2cPins() {
   digitalWrite(kAsm330Sa0Pin, kAsm330Sa0High ? HIGH : LOW);
 }
 
+void selectAsm330I2cAddress(const bool sa0High) {
+  digitalWrite(kAsm330Sa0Pin, sa0High ? HIGH : LOW);
+  delay(2);
+  g_asm330I2cAddress = sa0High ? kAsm330I2cAddressHigh : kAsm330I2cAddressLow;
+  g_asm330Sensor = sa0High ? &asm330SensorHigh : &asm330SensorLow;
+}
+
 void printAsm330I2cScan(const char *prefix) {
   const uint8_t addresses[] = {kAsm330I2cAddressLow, kAsm330I2cAddressHigh};
   for (size_t index = 0; index < (sizeof(addresses) / sizeof(addresses[0])); ++index) {
@@ -2549,11 +2666,10 @@ bool initAsm330() {
   detachInterrupt(digitalPinToInterrupt(kAsm330DrdyPin));
 
   prepareAsm330I2cPins();
-  g_asm330I2cAddress = kAsm330Sa0High ? kAsm330I2cAddressHigh : kAsm330I2cAddressLow;
-  g_asm330Sensor = kAsm330Sa0High ? &asm330SensorHigh : &asm330SensorLow;
 
   imuI2c.begin(kAsm330SdaPin, kAsm330SclPin, kAsm330I2cHz);
   imuI2c.setTimeOut(20);
+  selectAsm330I2cAddress(kAsm330Sa0High);
   delay(10);
   printAsm330I2cScan("BOOT,ASM330,I2C_SCAN");
 
@@ -2572,14 +2688,37 @@ bool initAsm330() {
       static_cast<unsigned long>(kAsm330I2cHz));
 
   uint8_t whoAmI = 0;
-  for (uint32_t attempt = 1; attempt <= kAsm330StartupRetries; ++attempt) {
-    whoAmI = asm330ReadRegister(kAsm330RegWhoAmI);
-    g_asm330LastWhoAmI = whoAmI;
-    Serial.printf("BOOT,ASM330,WHOAMI_ATTEMPT,%lu,0x%02X\n", static_cast<unsigned long>(attempt), whoAmI);
+  const bool sa0Candidates[] = {kAsm330Sa0High, !kAsm330Sa0High};
+  uint32_t attempt = 0;
+  for (const bool sa0High : sa0Candidates) {
+    selectAsm330I2cAddress(sa0High);
+    Serial.printf(
+        "BOOT,ASM330,PROBE,SA0=%u,ADDR=0x%02X,SDA=%d,SCL=%d,CS=%d\n",
+        sa0High ? 1U : 0U,
+        g_asm330I2cAddress,
+        digitalRead(kAsm330SdaPin),
+        digitalRead(kAsm330SclPin),
+        (kAsm330CsPin >= 0) ? digitalRead(kAsm330CsPin) : -1);
+
+    for (uint32_t retry = 1; retry <= kAsm330StartupRetries; ++retry) {
+      ++attempt;
+      whoAmI = asm330ReadRegister(kAsm330RegWhoAmI);
+      g_asm330LastWhoAmI = whoAmI;
+      Serial.printf(
+          "BOOT,ASM330,WHOAMI_ATTEMPT,%lu,SA0=%u,ADDR=0x%02X,WHOAMI=0x%02X\n",
+          static_cast<unsigned long>(attempt),
+          sa0High ? 1U : 0U,
+          g_asm330I2cAddress,
+          whoAmI);
+      if (whoAmI == kAsm330WhoAmIValue) {
+        break;
+      }
+      delay(10);
+    }
+
     if (whoAmI == kAsm330WhoAmIValue) {
       break;
     }
-    delay(10);
   }
 
   if (whoAmI != kAsm330WhoAmIValue) {
@@ -2669,6 +2808,10 @@ bool initAsm330() {
 }
 
 void serviceAsm330InitRetry() {
+  // ASM330 runtime disabled – no init retry loop
+  return;
+
+#if 0
   if (!g_asm330InitRetryEnabled || g_imuReady) {
     return;
   }
@@ -2680,6 +2823,7 @@ void serviceAsm330InitRetry() {
 
   Serial.printf("ASM330,INIT,ATTEMPT,%lu\n", static_cast<unsigned long>(g_asm330InitCycleCount + 1U));
   g_imuReady = initAsm330();
+#endif
 }
 
 bool initTwai() {
@@ -2769,14 +2913,11 @@ void serviceMcpStatus() {
   uint8_t txErrorCount = 0;
   uint8_t rxErrorCount = 0;
   uint8_t rxPending = 0;
-  if (takeMcpBus()) {
-    errorFlags = mcp2515.getError();
-    txErrorCount = mcp2515.errorCountTX();
-    rxErrorCount = mcp2515.errorCountRX();
-    rxPending = mcp2515.checkReceive() == CAN_MSGAVAIL ? 1U : 0U;
-    giveMcpBus();
-    g_mcpLastErrorFlags = errorFlags;
-  }
+  errorFlags = mcp2515Fast.getErrorFlags();
+  txErrorCount = mcp2515Fast.getTransmitErrorCount();
+  rxErrorCount = mcp2515Fast.getReceiveErrorCount();
+  rxPending = (mcp2515Fast.getInterruptFlags() & (kMcp2515InterruptRx0 | kMcp2515InterruptRx1)) != 0U ? 1U : 0U;
+  g_mcpLastErrorFlags = errorFlags;
 
   Serial.printf(
       "MCP2515,STATE,INT=%u,PENDING=%u,EFLG=0x%02X,TEC=%u,REC=%u,RX_FRAMES=%lu,QUEUE_DROP=%lu,OSC=%s\n",
@@ -3184,6 +3325,12 @@ bool handleModemSerialCommand(const char *line) {
     return true;
   }
 
+  if (strcmp(line, "MODEMSETUP") == 0) {
+    g_modemSetupRequested = true;
+    Serial.println("MODEM,CMD,SETUP");
+    return true;
+  }
+
   if (strcmp(line, "MODEMDISCONNECT") == 0) {
     g_modemDisconnectRequested = true;
     Serial.println("MODEM,CMD,DISCONNECT");
@@ -3199,6 +3346,18 @@ bool handleModemSerialCommand(const char *line) {
   if (strcmp(line, "MODEMRESET") == 0) {
     g_modemResetRequested = true;
     Serial.println("MODEM,CMD,RESET");
+    return true;
+  }
+
+  if (strcmp(line, "BRIDGEONLY") == 0) {
+    g_bridgeOnlyMode = true;
+    Serial.println("BRIDGE,MODE,ONLY,CAN_UART_USB");
+    return true;
+  }
+
+  if (strcmp(line, "BRIDGEFULL") == 0) {
+    g_bridgeOnlyMode = false;
+    Serial.println("BRIDGE,MODE,FULL,ALL_SUBSYSTEMS");
     return true;
   }
 
@@ -3296,7 +3455,7 @@ bool handleModemSerialCommand(const char *line) {
   }
 
   if (strcmp(line, "MODEMHELP") == 0) {
-    Serial.println("MODEM,CMD,MODEMSTATE|MODEMCONNECT|MODEMDISCONNECT|MODEMPWRKEY|MODEMRESET|MODEMAPN,<apn>,<user>,<pass>|MODEMHTTP,<host>,<path>|MQTTSTATE|MQTTON|MQTTOFF|MQTTCFG,<host>,<port>,<client>,<prefix>|MQTTAUTH,<user>,<pass>");
+    Serial.println("MODEM,CMD,MODEMSTATE|MODEMSETUP|MODEMCONNECT|MODEMDISCONNECT|MODEMPWRKEY|MODEMRESET|BRIDGEONLY|BRIDGEFULL|MODEMAPN,<apn>,<user>,<pass>|MODEMHTTP,<host>,<path>|MQTTSTATE|MQTTON|MQTTOFF|MQTTCFG,<host>,<port>,<client>,<prefix>|MQTTAUTH,<user>,<pass>");
     return true;
   }
 
@@ -3627,44 +3786,18 @@ uint32_t serviceMcpRx() {
   can_frame frame = {};
   uint32_t drainedCount = 0;
   while (true) {
-    INT32U rawIdentifier = 0;
-    uint8_t extended = 0;
-    uint8_t dlc = 0;
-    uint8_t data[8] = {};
-    uint8_t readStatus = CAN_NOMSG;
-    uint8_t errorFlags = g_mcpLastErrorFlags;
+    const Mcp2515Driver::Error readStatus = mcp2515Fast.readMessage(&frame);
 
-    if (!takeMcpBus()) {
+    if (readStatus == Mcp2515Driver::Error::NoMessage) {
+      break;
+    }
+
+    if (readStatus != Mcp2515Driver::Error::Ok) {
       ++g_mcpRxReadErrorCount;
-      g_mcpLastReadErrCanintf = 0xFFU;
+      g_mcpLastReadErrEflg = g_mcpLastErrorFlags;
+      g_mcpLastReadErrCanintf = static_cast<uint8_t>(readStatus);
       break;
     }
-
-    readStatus = mcp2515.readMsgBuf(&rawIdentifier, &extended, &dlc, data);
-    errorFlags = mcp2515.getError();
-    giveMcpBus();
-
-    if ((errorFlags & (MCP_EFLG_RX0OVR | MCP_EFLG_RX1OVR)) != 0U &&
-        (g_mcpLastErrorFlags & (MCP_EFLG_RX0OVR | MCP_EFLG_RX1OVR)) == 0U) {
-      ++g_mcpRxOverrunCount;
-      g_mcpLastOverrunEflg = errorFlags;
-    }
-    g_mcpLastErrorFlags = errorFlags;
-
-    if (readStatus == CAN_NOMSG) {
-      break;
-    }
-
-    if (readStatus != CAN_OK) {
-      ++g_mcpRxReadErrorCount;
-      g_mcpLastReadErrEflg = errorFlags;
-      g_mcpLastReadErrCanintf = readStatus;
-      break;
-    }
-
-    frame.can_id = (extended != 0U) ? ((rawIdentifier & CAN_EFF_MASK) | CAN_EFF_FLAG) : (rawIdentifier & CAN_SFF_MASK);
-    frame.can_dlc = dlc <= CAN_MAX_DLEN ? dlc : CAN_MAX_DLEN;
-    memcpy(frame.data, data, frame.can_dlc);
 
     ++drainedCount;
     ++g_mcpRxFrameCount;
@@ -3672,12 +3805,23 @@ uint32_t serviceMcpRx() {
       QueuedCanFrame queuedFrame = {};
       queuedFrame.frame = frame;
       queuedFrame.timestampMs = millis();
-      if (xQueueSend(g_mcpRxQueue, &queuedFrame, pdMS_TO_TICKS(1)) != pdPASS) {
+      if (xQueueSend(g_mcpRxQueue, &queuedFrame, 0) != pdPASS) {
         ++g_mcpQueueDropCount;
       }
     } else {
       printMcpFrame(frame, millis());
     }
+  }
+
+  if (drainedCount > 0U || digitalRead(kMcp2515IntPin) == LOW) {
+    const uint8_t errorFlags = mcp2515Fast.getErrorFlags();
+    if ((errorFlags & (kMcp2515EflgRx0Ovr | kMcp2515EflgRx1Ovr)) != 0U) {
+      ++g_mcpRxOverrunCount;
+      g_mcpLastOverrunEflg = errorFlags;
+      mcp2515Fast.clearRxOverflow();
+    }
+    mcp2515Fast.clearErrorInterrupts();
+    g_mcpLastErrorFlags = errorFlags;
   }
 
   return drainedCount;
@@ -3702,7 +3846,11 @@ void serviceMcpRxQueue(const uint32_t maxFrames) {
 void mcpServiceTask(void *parameter) {
   (void)parameter;
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
+    if (digitalRead(kMcp2515IntPin) != LOW) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
+    } else {
+      ulTaskNotifyTake(pdTRUE, 0);
+    }
     const uint32_t drainedCount = serviceMcpRx();
     if (drainedCount > 0U || digitalRead(kMcp2515IntPin) == LOW) {
       taskYIELD();
@@ -3738,24 +3886,22 @@ void sendMcpFrameRaw(const uint32_t identifier, const bool extended, const uint8
   }
 
   const uint8_t clampedLength = (length <= 8U) ? length : 8U;
-  uint8_t sendStatus = CAN_FAIL;
+  Mcp2515Driver::Error sendStatus = Mcp2515Driver::Error::Fail;
   uint8_t errorFlags = g_mcpLastErrorFlags;
   uint8_t txErrorCount = 0;
 
-  if (!takeMcpBus()) {
-    Serial.println("ERR,MCP_TX,MUTEX");
-    return;
-  }
-
-  sendStatus = mcp2515.sendMsgBuf(identifier, extended ? 1U : 0U, clampedLength, const_cast<uint8_t *>(payload));
-  errorFlags = mcp2515.getError();
-  txErrorCount = mcp2515.errorCountTX();
-  giveMcpBus();
+  can_frame frame = {};
+  frame.can_id = extended ? ((identifier & CAN_EFF_MASK) | CAN_EFF_FLAG) : (identifier & CAN_SFF_MASK);
+  frame.can_dlc = clampedLength;
+  memcpy(frame.data, payload, clampedLength);
+  sendStatus = mcp2515Fast.sendMessage(&frame);
+  errorFlags = mcp2515Fast.getErrorFlags();
+  txErrorCount = mcp2515Fast.getTransmitErrorCount();
 
   g_mcpLastErrorFlags = errorFlags;
 
-  if (sendStatus != CAN_OK) {
-    Serial.printf("ERR,MCP_TX,EFLG=0x%02X,STATUS=%u,TEC=%u\n", errorFlags, sendStatus, txErrorCount);
+  if (sendStatus != Mcp2515Driver::Error::Ok) {
+    Serial.printf("ERR,MCP_TX,EFLG=0x%02X,STATUS=%u,TEC=%u\n", errorFlags, static_cast<uint8_t>(sendStatus), txErrorCount);
   }
 }
 
@@ -4051,9 +4197,11 @@ void setup() {
   digitalWrite(kGnssResetPin, HIGH);
   pinMode(kGnssTimePulsePin, INPUT);
   pinMode(kModemResetPin, OUTPUT);
+  // Keep RESET_N deasserted except explicit reset pulses.
   digitalWrite(kModemResetPin, LOW);
   pinMode(kModemPwrKeyPin, OUTPUT);
   digitalWrite(kModemPwrKeyPin, LOW);
+  g_modemBootPowerKeyPending = kModemAutoPowerKeyOnBoot;
 
   g_canSpiMutex = xSemaphoreCreateMutex();
   if (g_canSpiMutex == nullptr) {
@@ -4080,20 +4228,20 @@ void setup() {
       Serial.println("BOOT,MCP2515,ERR,RX_QUEUE");
     }
   }
-  g_sdReady = initSdCard();
-  g_sdError = !g_sdReady;
-  printSdState("SD,STATE");
-  if (kEnableAsm330Runtime) {
-    g_imuReady = initAsm330();
-    if (!g_imuReady) {
-      g_asm330LastInitSucceeded = false;
-      g_asm330InitFailureCount++;
-      printAsm330InitState("ASM330,INIT,STATE");
-    }
+
+  // SD init – non-blocking: only probe if already in full mode, skip in bridge-only
+  if (!g_bridgeOnlyMode) {
+    g_sdReady = initSdCard();
+    g_sdError = !g_sdReady;
+    printSdState("SD,STATE");
   } else {
-    g_imuReady = false;
-    Serial.println("BOOT,ASM330,DISABLED");
+    g_sdReady = false;
+    g_sdError = true;
+    Serial.println("SD,DISABLED,BRIDGE_ONLY");
   }
+
+  // ASM330 disabled globally for bridge-first operation
+  Serial.println("BOOT,ASM330,DISABLED");
 
   if (g_mcpReady && g_mcpRxQueue != nullptr) {
     if (xTaskCreatePinnedToCore(
@@ -4111,27 +4259,33 @@ void setup() {
     }
   }
 
-  if (xTaskCreatePinnedToCore(
-          gnssServiceTask,
-          "gnss-service",
-          kGnssTaskStack,
-          nullptr,
-          kGnssTaskPriority,
-          &g_gnssTaskHandle,
-          kGnssTaskCore) != pdPASS) {
-    Serial.println("BOOT,GNSS,ERR,TASK");
-    g_gnssTaskHandle = nullptr;
-  }
+  if (!g_bridgeOnlyMode) {
+    if (xTaskCreatePinnedToCore(
+            gnssServiceTask,
+            "gnss-service",
+            kGnssTaskStack,
+            nullptr,
+            kGnssTaskPriority,
+            &g_gnssTaskHandle,
+            kGnssTaskCore) != pdPASS) {
+      Serial.println("BOOT,GNSS,ERR,TASK");
+      g_gnssTaskHandle = nullptr;
+    }
 
-  if (xTaskCreatePinnedToCore(
-          modemServiceTask,
-          "modem-service",
-          kModemTaskStack,
-          nullptr,
-          kModemTaskPriority,
-          &g_modemTaskHandle,
-          kModemTaskCore) != pdPASS) {
-    Serial.println("BOOT,MODEM,ERR,TASK");
+    if (xTaskCreatePinnedToCore(
+            modemServiceTask,
+            "modem-service",
+            kModemTaskStack,
+            nullptr,
+            kModemTaskPriority,
+            &g_modemTaskHandle,
+            kModemTaskCore) != pdPASS) {
+      Serial.println("BOOT,MODEM,ERR,TASK");
+      g_modemTaskHandle = nullptr;
+    }
+  } else {
+    Serial.println("BOOT,BRIDGE_ONLY,GNSS_AND_MODEM_DISABLED");
+    g_gnssTaskHandle = nullptr;
     g_modemTaskHandle = nullptr;
   }
 
@@ -4149,10 +4303,9 @@ void setup() {
 void loop() {
   serviceSerialCommands();
   serviceRecordButton();
-  serviceRecordingState();
   updateLeds();
-  serviceGnssStatusReport();
-  serviceModemStatusReport();
+
+  // CAN-UART bridge is always active (top priority).
   serviceMcpRxQueue(kMcpQueueDrainBudgetPerLoop);
   serviceTwaiRx(kTwaiRxBudgetPerLoop);
   serviceMcpRxQueue(kMcpQueueDrainBudgetPerLoop);
@@ -4161,24 +4314,23 @@ void loop() {
     serviceMcpRx();
   }
   serviceMcpRxQueue(kMcpQueueDrainBudgetPerLoop);
+  serviceMcpErrorReport();
+  serviceMcpStatus();
+  serviceMcpRecovery();
+
+  // Everything below is gated behind full mode.
+  if (g_bridgeOnlyMode) {
+    delay(1);
+    return;
+  }
+
+  serviceRecordingState();
+  serviceGnssStatusReport();
+  serviceModemStatusReport();
   serviceSdHealthCheck();
   serviceSdLogWriter();
   serviceSerialCommands();
   serviceRecordButton();
-  serviceMcpErrorReport();
-  serviceMcpStatus();
-  serviceMcpRecovery();
-  if (kEnableAsm330Runtime) {
-    serviceAsm330InitRetry();
-    serviceAsm330Debug();
-
-    ImuSample sample = {};
-    if (readAsm330Sample(sample)) {
-      ++g_sampleCounter;
-      printImuSample(sample);
-      publishImuToCan(sample);
-    }
-  }
 
   delay(1);
 }
