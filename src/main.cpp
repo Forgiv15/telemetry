@@ -29,9 +29,9 @@ constexpr uint32_t kSerialBaud = 2000000;
 constexpr uint32_t kHeartbeatHalfPeriodMs = 25;
 constexpr uint32_t kSdErrorHalfPeriodMs = 250;
 constexpr uint32_t kAsm330DebugPeriodMs = 1000;
-constexpr uint32_t kAsm330RetryPeriodMs = 250;
+constexpr uint32_t kAsm330RetryPeriodMs = 1000;
 constexpr uint32_t kTwaiStatusPeriodMs = 1000;
-constexpr uint32_t kAsm330StartupRetries = 20;
+constexpr uint32_t kAsm330StartupRetries = 10;
 constexpr uint32_t kHardStopLatchMs = 1000;
 constexpr float kHardStopThresholdG = 10.0f;
 
@@ -48,8 +48,8 @@ constexpr int kAsm330SclPin = 8;
 constexpr int kAsm330DrdyPin = 45;
 constexpr int kAsm330CsPin = 35;  // bodge wire: was GND, now IO35
 constexpr bool kAsm330Sa0High = false;
-constexpr uint32_t kAsm330I2cHz = 100000;
-constexpr bool kEnableAsm330Runtime = false;  // ASM330 disabled – bridge-first operation
+constexpr uint32_t kAsm330I2cHz = 400000;
+constexpr bool kEnableAsm330Runtime = true;  // I2C ASM330LHH enabled
 
 constexpr int kSdCsPin = 9;
 constexpr int kMcp2515CsPin = 10;
@@ -2808,10 +2808,6 @@ bool initAsm330() {
 }
 
 void serviceAsm330InitRetry() {
-  // ASM330 runtime disabled – no init retry loop
-  return;
-
-#if 0
   if (!g_asm330InitRetryEnabled || g_imuReady) {
     return;
   }
@@ -2823,7 +2819,6 @@ void serviceAsm330InitRetry() {
 
   Serial.printf("ASM330,INIT,ATTEMPT,%lu\n", static_cast<unsigned long>(g_asm330InitCycleCount + 1U));
   g_imuReady = initAsm330();
-#endif
 }
 
 bool initTwai() {
@@ -3296,9 +3291,30 @@ bool handleSdSerialCommand(const char *line) {
 
 bool handleModemSerialCommand(const char *line) {
   if (strcmp(line, "MODEMSTATE") == 0) {
+    // Trigger a fresh AT probe / modem health check via the modem task.
+    g_modemSetupRequested = true;
+    // Print whatever state we have right now; the modem task will update
+    // the cached state on its next iteration for subsequent reads.
     printModemState("MODEM,STATE");
     printNtripState("NTRIP,STATE");
     printMqttState("MQTT,STATE");
+    return true;
+  }
+
+  // Lightweight inline AT probe – prints MODEM,PROBE,OK or MODEM,PROBE,FAIL
+  // without going through the full setup path.
+  if (strcmp(line, "MODEMPROBE") == 0) {
+    // Give the modem task a chance to configure UART2 first.
+    vTaskDelay(pdMS_TO_TICKS(1));
+    const bool atOk = g_modem.testAT(kModemAtProbeTimeoutMs);
+    Serial.printf("MODEM,PROBE,%s\n", atOk ? "OK" : "FAIL");
+    if (atOk) {
+      // Update cached state so MODEMSTATE reflects the live result.
+      if (takeMutex(g_cellularStateMutex, pdMS_TO_TICKS(10))) {
+        g_cellularState.uartReady = true;
+        giveMutex(g_cellularStateMutex);
+      }
+    }
     return true;
   }
 
@@ -4240,8 +4256,19 @@ void setup() {
     Serial.println("SD,DISABLED,BRIDGE_ONLY");
   }
 
-  // ASM330 disabled globally for bridge-first operation
-  Serial.println("BOOT,ASM330,DISABLED");
+  // ASM330 I2C init – probe on startup with auto-retry on failure
+  if (kEnableAsm330Runtime) {
+    g_imuReady = initAsm330();
+    if (!g_imuReady) {
+      g_asm330LastInitSucceeded = false;
+      g_asm330InitRetryEnabled = true;
+      Serial.println("BOOT,ASM330,RETRY_ENABLED");
+      printAsm330InitState("ASM330,INIT,STATE");
+    }
+  } else {
+    g_imuReady = false;
+    Serial.println("BOOT,ASM330,DISABLED");
+  }
 
   if (g_mcpReady && g_mcpRxQueue != nullptr) {
     if (xTaskCreatePinnedToCore(
@@ -4331,6 +4358,19 @@ void loop() {
   serviceSdLogWriter();
   serviceSerialCommands();
   serviceRecordButton();
+
+  // ASM330 I2C runtime
+  if (kEnableAsm330Runtime) {
+    serviceAsm330InitRetry();
+    serviceAsm330Debug();
+
+    ImuSample sample = {};
+    if (readAsm330Sample(sample)) {
+      ++g_sampleCounter;
+      printImuSample(sample);
+      publishImuToCan(sample);
+    }
+  }
 
   delay(1);
 }
